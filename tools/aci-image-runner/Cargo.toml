@@ -1,0 +1,16 @@
+[package]
+name = "aci-image-runner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+aci_edge_sandboxes = "=0.1.2"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+aci_edge_sandboxes = { version = "=0.1.2", features = ["testing"] }
+tempfile = "3"
