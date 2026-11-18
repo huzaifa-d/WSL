@@ -166,6 +166,53 @@ mod tests {
     }
 
     #[test]
+    fn rejects_repeated_or_mixed_image_selectors() {
+        let bundle = absolute_path("bundle");
+        let state = absolute_path("state");
+        let image = absolute_path("image.vhd");
+        let other_image = absolute_path("other.vhd");
+        let cases = [
+            ("--image-file", image.as_str(), "--image", "alpine"),
+            ("--image", "alpine", "--image-file", image.as_str()),
+            ("--image", "alpine", "--image", "ubuntu"),
+            ("--image", "alpine", "--image", "alpine"),
+            (
+                "--image-file",
+                image.as_str(),
+                "--image-file",
+                image.as_str(),
+            ),
+            (
+                "--image-file",
+                image.as_str(),
+                "--image-file",
+                other_image.as_str(),
+            ),
+        ];
+        for (first, first_value, second, second_value) in cases {
+            let values = [
+                "--bundle",
+                &bundle,
+                "--state-root",
+                &state,
+                first,
+                first_value,
+                second,
+                second_value,
+                "--",
+                "true",
+            ];
+            assert_eq!(
+                parse(&values),
+                Err(format!(
+                    "{second} is repeated or conflicts with another option"
+                )),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_missing_or_empty_values() {
         let bundle = absolute_path("bundle");
         let state = absolute_path("state");

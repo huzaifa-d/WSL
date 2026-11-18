@@ -175,6 +175,52 @@ mod tests {
     }
 
     #[test]
+    fn rejects_repeated_or_mixed_image_selectors() {
+        let fixture = Fixture::new();
+        let image = fixture.dir.path().join("image.vhd").into_os_string();
+        let other_image = fixture.dir.path().join("other.vhd").into_os_string();
+        let cases = [
+            (
+                "--image-file",
+                image.clone(),
+                "--image",
+                OsString::from("alpine"),
+            ),
+            (
+                "--image",
+                OsString::from("alpine"),
+                "--image-file",
+                image.clone(),
+            ),
+            (
+                "--image",
+                OsString::from("alpine"),
+                "--image",
+                OsString::from("ubuntu"),
+            ),
+            (
+                "--image",
+                OsString::from("alpine"),
+                "--image",
+                OsString::from("alpine"),
+            ),
+            ("--image-file", image.clone(), "--image-file", image.clone()),
+            ("--image-file", image, "--image-file", other_image),
+        ];
+        for (first, first_value, second, second_value) in cases {
+            let mut args = fixture.args(first, first_value);
+            args.splice(6..6, [OsString::from(second), second_value]);
+            assert_eq!(
+                run(args, || Ok(()), fixture.trust),
+                Err(RunnerError::Arguments(format!(
+                    "{second} is repeated or conflicts with another option"
+                ))),
+                "{first} followed by {second}"
+            );
+        }
+    }
+
+    #[test]
     fn production_runner_refuses_tampered_manifest_and_library() {
         let fixture = Fixture::new();
         assert_eq!(fixture.run(), Err(RunnerError::NotImplemented));
