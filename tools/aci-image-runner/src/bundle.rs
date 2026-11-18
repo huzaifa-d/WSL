@@ -19,23 +19,50 @@ const LIBRARY_SHA256: [u8; 32] = [
     0xbc, 0x3e, 0x0e, 0x39, 0xd0, 0x0e, 0x72, 0x23, 0xc4, 0xc9, 0xb7, 0x77, 0x17, 0xf1, 0xc9, 0x9a,
 ];
 
-pub fn agent_config(bundle: &Path, state_root: &Path) -> Result<AgentConfig, String> {
-    // This preflight does not seal the files; the agent must recheck these pins when it loads them.
-    verify_files(bundle, &MANIFEST_SHA256, &LIBRARY_SHA256)?;
-    Ok(make_config(bundle, state_root))
+#[derive(Clone, Copy)]
+pub(crate) struct BundleTrust {
+    manifest_sha256: [u8; 32],
+    library_sha256: [u8; 32],
 }
 
-fn make_config(bundle: &Path, state_root: &Path) -> AgentConfig {
-    let runtime = RuntimeSource::Bundle(BundleSource {
-        path: bundle.to_owned(),
-        manifest_sha256: MANIFEST_SHA256,
-    });
-    let setup = SetupConfig::new(state_root, runtime).with_hypervisor(Hypervisor::Whp);
-    AgentConfig::new(
-        setup,
-        bundle.join("bin").join("aci_edge_agent.dll"),
-        LIBRARY_SHA256,
-    )
+impl BundleTrust {
+    pub(crate) const fn approved() -> Self {
+        Self {
+            manifest_sha256: MANIFEST_SHA256,
+            library_sha256: LIBRARY_SHA256,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(manifest_sha256: [u8; 32], library_sha256: [u8; 32]) -> Self {
+        Self {
+            manifest_sha256,
+            library_sha256,
+        }
+    }
+
+    pub(crate) fn agent_config(
+        self,
+        bundle: &Path,
+        state_root: &Path,
+    ) -> Result<AgentConfig, String> {
+        // This preflight does not seal the files; the agent must recheck these pins when it loads them.
+        verify_files(bundle, &self.manifest_sha256, &self.library_sha256)?;
+        Ok(self.make_config(bundle, state_root))
+    }
+
+    fn make_config(self, bundle: &Path, state_root: &Path) -> AgentConfig {
+        let runtime = RuntimeSource::Bundle(BundleSource {
+            path: bundle.to_owned(),
+            manifest_sha256: self.manifest_sha256,
+        });
+        let setup = SetupConfig::new(state_root, runtime).with_hypervisor(Hypervisor::Whp);
+        AgentConfig::new(
+            setup,
+            bundle.join("bin").join("aci_edge_agent.dll"),
+            self.library_sha256,
+        )
+    }
 }
 
 fn verify_files(
@@ -51,8 +78,12 @@ fn verify_files(
 }
 
 fn verify_file(path: &Path, expected: &[u8; 32]) -> Result<(), String> {
-    let mut file =
+    let file =
         File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    verify_reader(file, path, expected)
+}
+
+fn verify_reader(mut file: impl Read, path: &Path, expected: &[u8; 32]) -> Result<(), String> {
     let mut hash = Sha256::new();
     let mut buffer = [0; 65536];
     loop {
@@ -74,14 +105,12 @@ fn verify_file(path: &Path, expected: &[u8; 32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
-    use std::fs;
 
     #[test]
     fn passes_the_pinned_digests_to_the_official_configuration() {
         let bundle = std::env::current_dir().unwrap().join("bundle");
         let state = std::env::current_dir().unwrap().join("state");
-        let config = make_config(&bundle, &state);
+        let config = BundleTrust::approved().make_config(&bundle, &state);
         assert_eq!(config.setup.state_root, state);
         assert_eq!(config.setup.hypervisor, Some(Hypervisor::Whp));
         match config.setup.runtime {
@@ -109,35 +138,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tampered_manifest_and_library_copies() {
+    fn reports_missing_bundle_files() {
         let dir = tempfile::tempdir().unwrap();
-        let bundle = dir.path();
-        fs::create_dir(bundle.join("bin")).unwrap();
-        let manifest = bundle.join("SOURCE-MANIFEST.json");
-        let library = bundle.join("bin").join("aci_edge_agent.dll");
-        let manifest_contents = b"manifest fixture";
-        let library_contents = b"library fixture";
-        fs::write(&manifest, manifest_contents).unwrap();
-        fs::write(&library, library_contents).unwrap();
-        let manifest_digest = Sha256::digest(manifest_contents).into();
-        let library_digest = Sha256::digest(library_contents).into();
-        assert!(verify_files(bundle, &manifest_digest, &library_digest).is_ok());
-
-        fs::write(&manifest, b"tampered manifest").unwrap();
-        let error = verify_files(bundle, &manifest_digest, &library_digest).unwrap_err();
-        assert!(error.to_string().contains("SOURCE-MANIFEST.json"));
-        fs::write(&manifest, manifest_contents).unwrap();
-
-        fs::write(&library, b"tampered library").unwrap();
-        let error = verify_files(bundle, &manifest_digest, &library_digest).unwrap_err();
-        assert!(error.to_string().contains("aci_edge_agent.dll"));
+        let manifest = dir.path().join("SOURCE-MANIFEST.json");
+        let cause = File::open(&manifest).unwrap_err();
+        let error = BundleTrust::approved()
+            .agent_config(dir.path(), dir.path())
+            .unwrap_err();
+        assert_eq!(
+            error,
+            format!("cannot open {}: {cause}", manifest.display())
+        );
     }
 
     #[test]
-    fn reports_missing_bundle_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let error = agent_config(dir.path(), dir.path()).unwrap_err();
-        assert!(error.contains("SOURCE-MANIFEST.json"));
-        assert!(error.contains("cannot open"));
+    fn propagates_read_error_with_file_context() {
+        struct BrokenReader;
+        impl Read for BrokenReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic read failure"))
+            }
+        }
+        let path = Path::new("fixture");
+        assert_eq!(
+            verify_reader(BrokenReader, path, &[0; 32]),
+            Err(format!(
+                "cannot read {}: synthetic read failure",
+                path.display()
+            ))
+        );
     }
 }

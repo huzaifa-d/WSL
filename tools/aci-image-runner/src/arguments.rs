@@ -170,11 +170,15 @@ mod tests {
         let bundle = absolute_path("bundle");
         let state = absolute_path("state");
         for option in ["--bundle", "--state-root", "--image", "--image-file"] {
-            assert!(parse(&[option]).is_err(), "{option}");
-            assert!(parse(&[option, "--"]).is_err(), "{option}");
-            assert!(parse(&[option, ""]).is_err(), "{option}");
+            for values in [vec![option], vec![option, "--"], vec![option, ""]] {
+                assert_eq!(
+                    parse(&values),
+                    Err(format!("{option} requires a nonempty value")),
+                    "{values:?}"
+                );
+            }
         }
-        assert!(
+        assert_eq!(
             parse(&[
                 "--bundle",
                 &bundle,
@@ -184,10 +188,10 @@ mod tests {
                 "",
                 "--",
                 "true",
-            ])
-            .is_err()
+            ]),
+            Err("--image requires a nonempty value".into())
         );
-        assert!(
+        assert_eq!(
             parse(&[
                 "--bundle",
                 &bundle,
@@ -198,8 +202,8 @@ mod tests {
                 &state,
                 "--",
                 "true",
-            ])
-            .is_err()
+            ]),
+            Err("--image requires a nonempty value".into())
         );
     }
 
@@ -207,7 +211,15 @@ mod tests {
     fn rejects_missing_separator_or_program() {
         let bundle = absolute_path("bundle");
         let state = absolute_path("state");
-        for tail in [&[][..], &["true"][..], &["--"][..], &["--", ""][..]] {
+        for (tail, expected) in [
+            (&[][..], "missing -- separator before the guest program"),
+            (&["true"][..], "unknown option: true"),
+            (&["--"][..], "a nonempty guest program is required after --"),
+            (
+                &["--", ""][..],
+                "a nonempty guest program is required after --",
+            ),
+        ] {
             let mut values = vec![
                 "--bundle",
                 &bundle,
@@ -217,7 +229,7 @@ mod tests {
                 "alpine",
             ];
             values.extend_from_slice(tail);
-            assert!(parse(&values).is_err(), "{tail:?}");
+            assert_eq!(parse(&values), Err(expected.into()), "{tail:?}");
         }
     }
 
@@ -226,51 +238,63 @@ mod tests {
         let bundle = absolute_path("bundle");
         let state = absolute_path("state");
         let image = absolute_path("image.vhd");
-        for values in [
-            vec![
-                "--bundle",
-                "relative",
-                "--state-root",
-                &state,
-                "--image",
-                "a",
-                "--",
-                "true",
-            ],
-            vec![
-                "--bundle",
-                &bundle,
-                "--state-root",
-                "relative",
-                "--image",
-                "a",
-                "--",
-                "true",
-            ],
-            vec![
-                "--bundle",
-                &bundle,
-                "--state-root",
-                &state,
-                "--image-file",
-                "relative",
-                "--",
-                "true",
-            ],
-            vec![
-                "--bundle",
-                &bundle,
-                "--state-root",
-                &state,
-                "--image",
-                "a",
-                "--image-file",
-                &image,
-                "--",
-                "true",
-            ],
+        for (values, expected) in [
+            (
+                vec![
+                    "--bundle",
+                    "relative",
+                    "--state-root",
+                    &state,
+                    "--image",
+                    "a",
+                    "--",
+                    "true",
+                ],
+                "--bundle must be an absolute path",
+            ),
+            (
+                vec![
+                    "--bundle",
+                    &bundle,
+                    "--state-root",
+                    "relative",
+                    "--image",
+                    "a",
+                    "--",
+                    "true",
+                ],
+                "--state-root must be an absolute path",
+            ),
+            (
+                vec![
+                    "--bundle",
+                    &bundle,
+                    "--state-root",
+                    &state,
+                    "--image-file",
+                    "relative",
+                    "--",
+                    "true",
+                ],
+                "--image-file must be an absolute path",
+            ),
+            (
+                vec![
+                    "--bundle",
+                    &bundle,
+                    "--state-root",
+                    &state,
+                    "--image",
+                    "a",
+                    "--image-file",
+                    &image,
+                    "--",
+                    "true",
+                ],
+                "--image-file is repeated or conflicts with another option",
+            ),
         ] {
-            assert!(parse(&values).is_err(), "{values:?}");
+            assert_eq!(parse(&values), Err(expected.into()), "{values:?}");
         }
     }
 
@@ -278,35 +302,50 @@ mod tests {
     fn rejects_missing_duplicate_and_unknown_options() {
         let bundle = absolute_path("bundle");
         let state = absolute_path("state");
-        for values in [
-            vec!["--state-root", &state, "--image", "a", "--", "true"],
-            vec!["--bundle", &bundle, "--image", "a", "--", "true"],
-            vec!["--bundle", &bundle, "--state-root", &state, "--", "true"],
-            vec![
-                "--bundle",
-                &bundle,
-                "--bundle",
-                &bundle,
-                "--state-root",
-                &state,
-                "--image",
-                "a",
-                "--",
-                "true",
-            ],
-            vec![
-                "--bundle",
-                &bundle,
-                "--state-root",
-                &state,
-                "--image",
-                "a",
-                "--unknown",
-                "--",
-                "true",
-            ],
+        for (values, expected) in [
+            (
+                vec!["--state-root", &state, "--image", "a", "--", "true"],
+                "--bundle is required",
+            ),
+            (
+                vec!["--bundle", &bundle, "--image", "a", "--", "true"],
+                "--state-root is required",
+            ),
+            (
+                vec!["--bundle", &bundle, "--state-root", &state, "--", "true"],
+                "exactly one of --image and --image-file is required",
+            ),
+            (
+                vec![
+                    "--bundle",
+                    &bundle,
+                    "--bundle",
+                    &bundle,
+                    "--state-root",
+                    &state,
+                    "--image",
+                    "a",
+                    "--",
+                    "true",
+                ],
+                "--bundle is repeated or conflicts with another option",
+            ),
+            (
+                vec![
+                    "--bundle",
+                    &bundle,
+                    "--state-root",
+                    &state,
+                    "--image",
+                    "a",
+                    "--unknown",
+                    "--",
+                    "true",
+                ],
+                "unknown option: --unknown",
+            ),
         ] {
-            assert!(parse(&values).is_err(), "{values:?}");
+            assert_eq!(parse(&values), Err(expected.into()), "{values:?}");
         }
     }
 
@@ -325,6 +364,58 @@ mod tests {
             OsString::from("true"),
         ];
         values.push(OsString::from_wide(&[0xD800]));
-        assert!(Arguments::parse(values).unwrap_err().contains("Unicode"));
+        assert_eq!(
+            Arguments::parse(values),
+            Err("guest program and arguments must be Unicode".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_forms_are_checked_for_each_path_option() {
+        for (index, option) in [(1, "--bundle"), (3, "--state-root"), (5, "--image-file")] {
+            for path in [r"C:\bundle", r"\\server\share\bundle", r"\\?\C:\bundle"] {
+                let mut values = vec![
+                    "--bundle",
+                    r"C:\bundle",
+                    "--state-root",
+                    r"C:\state",
+                    "--image-file",
+                    r"C:\image.vhd",
+                    "--",
+                    "true",
+                ];
+                values[index] = path;
+                let parsed = parse(&values).unwrap();
+                let actual = match option {
+                    "--bundle" => parsed.bundle,
+                    "--state-root" => parsed.state_root,
+                    "--image-file" => match parsed.image {
+                        Image::File(path) => path,
+                        _ => panic!("expected image file"),
+                    },
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual, std::path::PathBuf::from(path), "{option}: {path}");
+            }
+            for path in [r"C:bundle", r"\bundle", r"bundle", r"C:"] {
+                let mut values = vec![
+                    "--bundle",
+                    r"C:\bundle",
+                    "--state-root",
+                    r"C:\state",
+                    "--image-file",
+                    r"C:\image.vhd",
+                    "--",
+                    "true",
+                ];
+                values[index] = path;
+                assert_eq!(
+                    parse(&values),
+                    Err(format!("{option} must be an absolute path")),
+                    "{option}: {path}"
+                );
+            }
+        }
     }
 }
