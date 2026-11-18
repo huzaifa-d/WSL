@@ -41,15 +41,54 @@ fn validate_host(os: &str, arch: &str, native_x64: bool) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn native_x64() -> Result<bool, String> {
-    use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
+type IsWow64Process2Fn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HANDLE,
+    *mut windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE,
+    *mut windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE,
+) -> windows_sys::core::BOOL;
 
+#[cfg(windows)]
+fn resolve_is_wow64_process2() -> Result<Option<IsWow64Process2Fn>, String> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExA, GetProcAddress,
+    };
+
+    let mut module = std::ptr::null_mut();
+    // The string and output pointer are valid; pinning keeps kernel32 loaded for the function pointer.
+    let result = unsafe {
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_PIN,
+            c"kernel32.dll".as_ptr().cast(),
+            &mut module,
+        )
+    };
+    if result == 0 {
+        return Err(format!(
+            "cannot find kernel32.dll: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // The named export has the IsWow64Process2 Windows ABI declared above.
+    let address = unsafe { GetProcAddress(module, c"IsWow64Process2".as_ptr().cast()) };
+    Ok(address.map(|function| unsafe {
+        std::mem::transmute::<unsafe extern "system" fn() -> isize, IsWow64Process2Fn>(function)
+    }))
+}
+
+#[cfg(windows)]
+fn native_x64_with_api(api: Option<IsWow64Process2Fn>) -> Result<bool, String> {
+    use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let query = api.ok_or(
+        "unsupported host: IsWow64Process2 is unavailable; native Windows x64 cannot be verified",
+    )?;
     let mut process_machine = 0;
     let mut native_machine = 0;
     // Both output pointers are valid, and GetCurrentProcess returns a process pseudo-handle.
     let success = unsafe {
-        IsWow64Process2(
+        query(
             GetCurrentProcess(),
             &mut process_machine,
             &mut native_machine,
@@ -64,9 +103,27 @@ fn native_x64() -> Result<bool, String> {
     Ok(native_machine == IMAGE_FILE_MACHINE_AMD64)
 }
 
+#[cfg(windows)]
+fn check_windows_host(
+    os: &str,
+    arch: &str,
+    resolve: impl FnOnce() -> Result<Option<IsWow64Process2Fn>, String>,
+) -> Result<(), String> {
+    validate_host(os, arch, native_x64_with_api(resolve()?)?)
+}
+
+#[cfg(windows)]
+fn check_current_host() -> Result<(), String> {
+    check_windows_host(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        resolve_is_wow64_process2,
+    )
+}
+
 #[cfg(not(windows))]
-fn native_x64() -> Result<bool, String> {
-    Ok(false)
+fn check_current_host() -> Result<(), String> {
+    validate_host(std::env::consts::OS, std::env::consts::ARCH, false)
 }
 
 fn run(
@@ -85,7 +142,7 @@ fn run(
 fn main() {
     if let Err(error) = run(
         std::env::args_os().skip(1),
-        || validate_host(std::env::consts::OS, std::env::consts::ARCH, native_x64()?),
+        check_current_host,
         BundleTrust::approved(),
     ) {
         eprintln!("{error}");
@@ -172,6 +229,97 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runner_reports_optional_host_api_and_native_architecture() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, SetLastError};
+        use windows_sys::Win32::System::SystemInformation::{
+            IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_UNKNOWN,
+        };
+
+        unsafe extern "system" fn native_amd64(
+            _: HANDLE,
+            process: *mut u16,
+            native: *mut u16,
+        ) -> i32 {
+            // The caller supplies writable pointers for both output values.
+            unsafe {
+                *process = IMAGE_FILE_MACHINE_UNKNOWN;
+                *native = IMAGE_FILE_MACHINE_AMD64;
+            }
+            1
+        }
+
+        unsafe extern "system" fn emulated_amd64(
+            _: HANDLE,
+            process: *mut u16,
+            native: *mut u16,
+        ) -> i32 {
+            // The caller supplies writable pointers for both output values.
+            unsafe {
+                *process = IMAGE_FILE_MACHINE_AMD64;
+                *native = IMAGE_FILE_MACHINE_ARM64;
+            }
+            1
+        }
+
+        unsafe extern "system" fn failed_query(_: HANDLE, _: *mut u16, _: *mut u16) -> i32 {
+            // SetLastError sets this thread's error code for the caller to report.
+            unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+            0
+        }
+
+        let fixture = Fixture::new();
+        let args = || fixture.args("--image", "alpine".into());
+        assert_eq!(
+            run(
+                args(),
+                || check_windows_host("windows", "x86_64", || Ok(None)),
+                fixture.trust,
+            ),
+            Err(RunnerError::Host(
+                "unsupported host: IsWow64Process2 is unavailable; native Windows x64 cannot be verified".into()
+            ))
+        );
+        assert_eq!(
+            run(
+                args(),
+                || check_windows_host("windows", "x86_64", || Ok(Some(native_amd64))),
+                fixture.trust,
+            ),
+            Err(RunnerError::NotImplemented)
+        );
+        assert_eq!(
+            run(
+                args(),
+                || check_windows_host("windows", "x86_64", || Ok(Some(emulated_amd64))),
+                fixture.trust,
+            ),
+            Err(RunnerError::Host(
+                "unsupported host or process architecture (windows/x86_64): native Windows x64 with WHP is required".into()
+            ))
+        );
+        assert_eq!(
+            run(
+                args(),
+                || check_windows_host("windows", "x86_64", || Ok(Some(failed_query))),
+                fixture.trust,
+            ),
+            Err(RunnerError::Host(format!(
+                "cannot determine native host architecture: {}",
+                std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
+            )))
+        );
+        assert_eq!(
+            run(
+                args(),
+                || check_windows_host("windows", "x86_64", || Err("module lookup failed".into())),
+                fixture.trust,
+            ),
+            Err(RunnerError::Host("module lookup failed".into()))
+        );
     }
 
     #[test]
