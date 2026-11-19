@@ -248,6 +248,41 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn production_runner_rejects_32_bit_windows_before_bundle() {
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::SystemInformation::{
+            IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386,
+        };
+
+        unsafe extern "system" fn x86_on_x64(
+            _: HANDLE,
+            process: *mut u16,
+            native: *mut u16,
+        ) -> i32 {
+            // The caller supplies writable pointers for both output values.
+            unsafe {
+                *process = IMAGE_FILE_MACHINE_I386;
+                *native = IMAGE_FILE_MACHINE_AMD64;
+            }
+            1
+        }
+
+        let fixture = Fixture::new();
+        fs::remove_file(fixture.manifest()).unwrap();
+        let error = run(
+            fixture.args("--image", "alpine".into()),
+            || check_windows_host("windows", "x86", || Ok(Some(x86_on_x64))),
+            fixture.trust,
+        )
+        .unwrap_err();
+        let message = "unsupported host or process architecture (windows/x86): native Windows x64 with WHP is required";
+        assert_eq!(error, RunnerError::Host(message.into()));
+        assert_eq!(error.to_string(), format!("aci-image-runner: {message}"));
+        assert_eq!(ERROR_EXIT_CODE, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn runner_reports_optional_host_api_and_native_architecture() {
         use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, SetLastError};
         use windows_sys::Win32::System::SystemInformation::{

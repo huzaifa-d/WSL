@@ -1,6 +1,6 @@
 // Copyright (C) Microsoft Corporation. All rights reserved.
 
-#![cfg(windows)]
+#![cfg(all(windows, target_pointer_width = "64"))]
 
 use object::read::pe::PeFile64;
 use object::read::{ImportFlags, NameOrOrdinal, Object};
