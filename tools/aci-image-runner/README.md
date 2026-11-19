@@ -147,3 +147,15 @@ When a failure returns after a sandbox ID is known, the error includes that ID
 and relevant cleanup failures; it does not assert that cleanup succeeded.
 Agent initialization failures report that host cleanup status may be unknown.
 If a call hangs, the runner may be unable to report an ID or cleanup outcome.
+
+Runner-generated host and bundle diagnostics retain their paths and OS errors.
+Agent and backend errors instead report the operation and stable error code but
+suppress their messages and causes, since those can contain the image reference
+or guest arguments, including escaped or very short values. Stream failures
+report their stage and I/O kind, preserving OS-generated diagnostics when
+available, but suppress other potentially sensitive details. A process-wide
+panic hook explicitly reports a panic and its source location while suppressing
+its payload: Rust calls the hook even for worker panics caught during cleanup. Stage-specific worker
+failure reports and normal panic/exit behaviour remain in effect.
+This intentionally sacrifices backend detail to avoid exposing secrets. Guest
+stdout and stderr are passed through unchanged and may themselves contain secrets.

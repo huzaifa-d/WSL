@@ -86,10 +86,10 @@ impl Fake {
         let mut state = self.state.lock().unwrap();
         state.events.push(name);
         if state.faults.contains(&name) {
-            Err(Error::backend_error(format!(
-                "{name} failed {}",
-                state.detail
-            )))
+            Err(
+                Error::backend_error(format!("{name} failed {}", state.detail))
+                    .with_source(io::Error::other(format!("source {}", state.detail))),
+            )
         } else {
             Ok(())
         }
@@ -299,8 +299,29 @@ fn invoke<W: Write + Send + 'static, E: Write + Send + 'static>(
     stdout: W,
     stderr: E,
 ) -> Result<i32, RunnerError> {
+    invoke_with_command(
+        state,
+        image,
+        stdout,
+        stderr,
+        vec![
+            "printf".into(),
+            "hello world".into(),
+            "a;$(touch nope)".into(),
+            "\"quoted\"".into(),
+        ],
+    )
+}
+
+fn invoke_with_command<W: Write + Send + 'static, E: Write + Send + 'static>(
+    state: Arc<Mutex<State>>,
+    image: (&str, OsString),
+    stdout: W,
+    stderr: E,
+    command: Vec<OsString>,
+) -> Result<i32, RunnerError> {
     let (dir, trust) = fixture();
-    let args = vec![
+    let mut args = vec![
         "--bundle".into(),
         dir.path().into(),
         "--state-root".into(),
@@ -308,11 +329,8 @@ fn invoke<W: Write + Send + 'static, E: Write + Send + 'static>(
         image.0.into(),
         image.1,
         "--".into(),
-        "printf".into(),
-        "hello world".into(),
-        "a;$(touch nope)".into(),
-        "\"quoted\"".into(),
     ];
+    args.extend(command);
     run_with(
         args,
         || Ok(()),
@@ -342,7 +360,10 @@ fn invoke<W: Write + Send + 'static, E: Write + Send + 'static>(
                 let mut state = state.lock().unwrap();
                 state.events.push("close");
                 if state.faults.contains(&"close") {
-                    Err(format!("close failed {}", state.detail))
+                    Err(AgentFailure::Backend(Error::backend_error(format!(
+                        "close failed {}",
+                        state.detail
+                    ))))
                 } else {
                     Ok(())
                 }
@@ -530,7 +551,15 @@ fn lifecycle_failures_keep_cleanup_order_and_sandbox_id() {
     ] {
         let (result, state) = run_case(&[fault], 0);
         let message = result.unwrap_err().to_string();
-        assert!(message.contains(&format!("{fault} failed")), "{message}");
+        let stage = if fault == "close" {
+            "close agent"
+        } else {
+            fault
+        };
+        assert!(
+            message.contains(&format!("{stage}: backend_error")),
+            "{message}"
+        );
         let state = state.lock().unwrap();
         assert_eq!(state.events, events, "{fault}");
         if let Some(id) = &state.id {
@@ -543,7 +572,11 @@ fn lifecycle_failures_keep_cleanup_order_and_sandbox_id() {
 fn failed_start_and_cleanup_and_close_are_all_reported() {
     let (result, state) = run_case(&["start", "deprovision", "close"], 0);
     let message = result.unwrap_err().to_string();
-    for text in ["start failed", "deprovision failed", "close failed"] {
+    for text in [
+        "start: backend_error",
+        "deprovision: backend_error",
+        "close agent: backend_error",
+    ] {
         assert!(message.contains(text), "{message}");
     }
     assert_eq!(
@@ -568,7 +601,7 @@ fn already_stopped_only_permits_cleanup_after_failed_start() {
         result
             .unwrap_err()
             .to_string()
-            .contains("injected already stopped")
+            .contains("stop: already_stopped")
     );
     assert!(!state.lock().unwrap().events.contains(&"deprovision"));
     let (result, state) = run_case(&["start", "already_stopped"], 0);
@@ -622,14 +655,7 @@ fn output_failure_still_stops_deprovisions_and_closes() {
         };
         let error = result.unwrap_err().to_string();
         assert!(error.contains(stream), "{error}");
-        assert!(
-            error.contains(if flush {
-                "flush failed"
-            } else {
-                "writer failed"
-            }),
-            "{error}"
-        );
+        assert!(error.contains("forwarding failed: Other"), "{error}");
         let state = state.lock().unwrap();
         assert!(state.cancels > 0);
         assert_eq!(
@@ -683,10 +709,10 @@ fn stopped_backend_workers_finish_before_deprovision_and_close() {
         .unwrap_err()
         .to_string();
         for expected in [
-            "writer failed",
-            "late wait failure",
-            "late cancel failure",
-            "close failed",
+            "stdout forwarding failed: Other",
+            "execution wait failed: backend_error",
+            "cancellation failed: backend_error",
+            "close agent: backend_error",
         ] {
             assert!(error.contains(expected), "{behavior:?}: {error}");
         }
@@ -716,7 +742,7 @@ fn stopped_backend_workers_finish_before_deprovision_and_close() {
         );
         assert_eq!(events.iter().filter(|event| **event == "close").count(), 1);
         if stop_fails {
-            assert!(error.contains("stop failed"), "{error}");
+            assert!(error.contains("stop: backend_error"), "{error}");
             assert!(!events.contains(&"deprovision"), "{events:?}");
         } else {
             assert!(
@@ -746,8 +772,11 @@ fn stuck_cancel_retains_backend_and_skips_deprovision_and_close() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("writer failed"), "{error}");
-    assert!(error.contains("late wait failure"), "{error}");
+    assert!(error.contains("stdout forwarding failed: Other"), "{error}");
+    assert!(
+        error.contains("execution wait failed: backend_error"),
+        "{error}"
+    );
     assert!(
         error.contains("backend wait or cancellation worker is still active"),
         "{error}"
@@ -787,8 +816,11 @@ fn stuck_wait_retains_backend_and_does_not_hide_the_unknown_outcome() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("writer failed"), "{error}");
-    assert!(error.contains("late cancel failure"), "{error}");
+    assert!(error.contains("stdout forwarding failed: Other"), "{error}");
+    assert!(
+        error.contains("cancellation failed: backend_error"),
+        "{error}"
+    );
     assert!(
         error.contains("outcome") && error.contains("unknown"),
         "{error}"
@@ -880,7 +912,7 @@ fn blocked_host_writer_does_not_prevent_safe_backend_close() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("stderr writer failed"), "{error}");
+    assert!(error.contains("stderr forwarding failed: Other"), "{error}");
     assert!(
         error.contains("host output forwarding worker did not finish"),
         "{error}"
@@ -928,4 +960,56 @@ fn primary_and_cleanup_errors_redact_raw_and_escaped_guest_values() {
     let state = state.lock().unwrap();
     assert!(!state.events.contains(&"deprovision"));
     assert!(error.contains(state.id.as_ref().unwrap()));
+}
+
+#[test]
+fn all_backend_stages_suppress_short_and_escaped_details() {
+    for detail in ["e", "private\"argument\\line\n"] {
+        let image = if detail == "e" {
+            "e"
+        } else {
+            "private.example/image"
+        };
+        for fault in [
+            "probe",
+            "provision",
+            "start",
+            "exec",
+            "stop",
+            "deprovision",
+            "close",
+        ] {
+            let state = Arc::new(Mutex::new(State {
+                faults: vec![fault],
+                detail: format!("raw={detail}; debug={detail:?}; image={image}"),
+                ..State::default()
+            }));
+            let error = invoke_with_command(
+                state.clone(),
+                ("--image", image.into()),
+                io::sink(),
+                io::sink(),
+                vec!["printf".into(), detail.into()],
+            )
+            .unwrap_err()
+            .to_string();
+            let stage = if fault == "close" {
+                "close agent"
+            } else {
+                fault
+            };
+            assert!(error.contains(&format!("{stage}: backend_error (backend details suppressed: may contain command or image)")), "{error}");
+            assert!(!error.contains("raw="), "{error}");
+            assert!(!error.contains("debug="), "{error}");
+            assert!(!error.contains("source "), "{error}");
+            assert!(!error.contains("image="), "{error}");
+            if detail.len() > 1 {
+                assert!(!error.contains(detail), "{error}");
+                assert!(!error.contains(&format!("{detail:?}")), "{error}");
+            }
+            if let Some(id) = &state.lock().unwrap().id {
+                assert!(error.contains(id), "{error}");
+            }
+        }
+    }
 }

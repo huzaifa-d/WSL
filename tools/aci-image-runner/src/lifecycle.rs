@@ -20,7 +20,6 @@ pub(crate) fn execute<W: Write + Send + 'static, E: Write + Send + 'static>(
     argv: Vec<String>,
     stdout: W,
     stderr: E,
-    redact: &impl Fn(String) -> String,
 ) -> Lifecycle {
     let mut backend_safe_to_close = true;
     let result = (|| {
@@ -33,11 +32,11 @@ pub(crate) fn execute<W: Write + Send + 'static, E: Write + Send + 'static>(
         }
         client
             .probe()
-            .map_err(|error| format!("probe: {}", redact(crate::error_chain(&error))))?;
+            .map_err(|error| format!("probe: {}", crate::backend_error(&error)))?;
 
         let id = client
             .provision(&ProvisionRequest::new())
-            .map_err(|error| format!("provision: {}", redact(crate::error_chain(&error))))?
+            .map_err(|error| format!("provision: {}", crate::backend_error(&error)))?
             .sandbox_id;
 
         let mut started = false;
@@ -48,37 +47,35 @@ pub(crate) fn execute<W: Write + Send + 'static, E: Write + Send + 'static>(
                 let request = ExecRequest::argv(argv).with_stdin(StdinMode::Null);
                 client
                     .exec(&id, &request)
-                    .map_err(|error| format!("exec: {}", redact(crate::error_chain(&error))))
+                    .map_err(|error| format!("exec: {}", crate::backend_error(&error)))
                     .map(|execution| {
-                        forwarding = Some(crate::streams::forward_redacted(
-                            execution, stdout, stderr, redact,
-                        ));
+                        forwarding = Some(crate::streams::forward_safe(execution, stdout, stderr));
                         0
                     })
             }
-            Err(error) => Err(format!("start: {}", redact(crate::error_chain(&error)))),
+            Err(error) => Err(format!("start: {}", crate::backend_error(&error))),
         };
 
         let stopped = match client.stop(&id) {
             Ok(_) => Ok(()),
             Err(error) if !started && error.code() == ErrorCode::AlreadyStopped => Ok(()),
-            Err(error) => Err(format!("stop: {}", redact(crate::error_chain(&error)))),
+            Err(error) => Err(format!("stop: {}", crate::backend_error(&error))),
         };
         if let Some(mut forwarding) = forwarding {
-            backend_safe_to_close = forwarding.finish_after_stop(redact);
+            backend_safe_to_close = forwarding.finish_after_stop();
             execution = forwarding
                 .into_result()
                 .map_err(|error| format!("execution: {error}"))
                 .and_then(|outcome| match outcome {
                     ExecOutcome::Exited(code) => Ok(code),
-                    outcome => Err(format!("execution: {}", redact(outcome.to_string()))),
+                    outcome => Err(format!("execution: {outcome}")),
                 });
         }
         let deprovisioned = if stopped.is_ok() && backend_safe_to_close {
             client
                 .deprovision(&id)
                 .map(|_| ())
-                .map_err(|error| format!("deprovision: {}", redact(crate::error_chain(&error))))
+                .map_err(|error| format!("deprovision: {}", crate::backend_error(&error)))
         } else {
             Ok(())
         };

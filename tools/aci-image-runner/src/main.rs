@@ -27,6 +27,27 @@ enum RunnerError {
     Runtime(String),
 }
 
+enum AgentFailure {
+    Backend(aci_edge_sandboxes::Error),
+    StillOwned,
+}
+
+impl AgentFailure {
+    fn diagnostic(&self) -> String {
+        match self {
+            Self::Backend(error) => backend_error(error),
+            Self::StillOwned => "agent backend still has owners".to_owned(),
+        }
+    }
+}
+
+fn backend_error(error: &aci_edge_sandboxes::Error) -> String {
+    format!(
+        "{} (backend details suppressed: may contain command or image)",
+        error.code().as_str()
+    )
+}
+
 impl fmt::Display for RunnerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -160,12 +181,12 @@ fn run(
         host_check,
         trust,
         |config| {
-            let backend = Arc::new(AgentBackend::new(config).map_err(|error| error_chain(&error))?);
+            let backend = Arc::new(AgentBackend::new(config).map_err(AgentFailure::Backend)?);
             Ok((backend, |backend: Arc<AgentBackend>| {
                 Arc::try_unwrap(backend)
-                    .map_err(|_| "agent backend still has owners".to_owned())?
+                    .map_err(|_| AgentFailure::StillOwned)?
                     .close()
-                    .map_err(|error| error_chain(&error))
+                    .map_err(AgentFailure::Backend)
             }))
         },
         output::writers,
@@ -176,25 +197,20 @@ fn run_with<B, C, W, E>(
     args: impl IntoIterator<Item = OsString>,
     host_check: impl FnOnce() -> Result<(), String>,
     trust: BundleTrust,
-    open: impl FnOnce(AgentConfig) -> Result<(Arc<B>, C), String>,
+    open: impl FnOnce(AgentConfig) -> Result<(Arc<B>, C), AgentFailure>,
     prepare_output: impl FnOnce() -> Result<(W, E), String>,
 ) -> Result<i32, RunnerError>
 where
     B: Backend + 'static,
-    C: FnOnce(Arc<B>) -> Result<(), String>,
+    C: FnOnce(Arc<B>) -> Result<(), AgentFailure>,
     W: Write + Send + 'static,
     E: Write + Send + 'static,
 {
     let args = Arguments::parse(args).map_err(RunnerError::Arguments)?;
-    let mut sensitive = args.command.clone();
-    if let Image::Reference(reference) = &args.image {
-        sensitive.push(reference.clone());
-    }
-    let redact = |message: String| redact_sensitive(message, &sensitive);
-    host_check().map_err(|error| RunnerError::Host(redact(error)))?;
+    host_check().map_err(RunnerError::Host)?;
     let mut config = trust
         .agent_config(&args.bundle, &args.state_root)
-        .map_err(|error| RunnerError::Bundle(redact(error)))?;
+        .map_err(RunnerError::Bundle)?;
     let image = match args.image {
         Image::Reference(reference) => ImageSource::Reference(reference),
         Image::File(path) => ImageSource::Path(path),
@@ -205,18 +221,18 @@ where
     config
         .setup
         .validate()
-        .map_err(|error| RunnerError::Runtime(format!("setup: {}", redact(error_chain(&error)))))?;
-    let (stdout, stderr) = prepare_output()
-        .map_err(|error| RunnerError::Runtime(format!("output: {}", redact(error))))?;
+        .map_err(|error| RunnerError::Runtime(format!("setup: {}", backend_error(&error))))?;
+    let (stdout, stderr) =
+        prepare_output().map_err(|error| RunnerError::Runtime(format!("output: {error}")))?;
     // AgentBackend::new may discard a host-close failure after opening the host.
     let (backend, close) = open(config).map_err(|error| {
         RunnerError::Runtime(format!(
             "open agent: {}; agent host cleanup status may be unknown",
-            redact(error)
+            error.diagnostic()
         ))
     })?;
     let client = AciEdgeSandbox::from_shared(backend.clone());
-    let lifecycle = lifecycle::execute(&client, args.command, stdout, stderr, &redact);
+    let lifecycle = lifecycle::execute(&client, args.command, stdout, stderr);
     drop(client);
     if !lifecycle.backend_safe_to_close {
         // Dropping AgentBackend would implicitly close the host while its control worker is active.
@@ -232,7 +248,7 @@ where
             "{detail}; close agent skipped: backend retained until process exit; late execution and close errors cannot be collected"
         )));
     }
-    let closed = close(backend).map_err(redact);
+    let closed = close(backend).map_err(|error| error.diagnostic());
     match (lifecycle.result, closed) {
         (Ok(completed), Ok(())) => Ok(completed.exit_code),
         (Err(error), Ok(())) => Err(RunnerError::Runtime(error)),
@@ -252,47 +268,20 @@ where
     }
 }
 
-fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    message
-}
-
-fn redact_sensitive(message: String, values: &[String]) -> String {
-    let mut patterns: Vec<String> = values
-        .iter()
-        .filter(|value| !value.is_empty())
-        .flat_map(|value| {
-            let escaped = format!("{value:?}");
-            [value.clone(), escaped[1..escaped.len() - 1].to_owned()]
-        })
-        .collect();
-    patterns.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    patterns.dedup();
-    let mut result = String::new();
-    let mut remaining = message.as_str();
-    while !remaining.is_empty() {
-        if let Some(pattern) = patterns
-            .iter()
-            .find(|pattern| remaining.starts_with(pattern.as_str()))
-        {
-            result.push_str("[redacted]");
-            remaining = &remaining[pattern.len()..];
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let mut stderr = std::io::stderr().lock();
+        if let Some(location) = info.location() {
+            let _ = write!(stderr, "aci-image-runner: panic at {location}; ");
         } else {
-            let ch = remaining.chars().next().unwrap();
-            result.push(ch);
-            remaining = &remaining[ch.len_utf8()..];
+            let _ = write!(stderr, "aci-image-runner: panic; ");
         }
-    }
-    result
+        let _ = writeln!(stderr, "details suppressed: may contain command or image");
+    }));
 }
 
 fn main() {
+    install_panic_hook();
     match run(
         std::env::args_os().skip(1),
         check_current_host,
@@ -314,8 +303,13 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    type MockOpenResult =
-        Result<(Arc<MockBackend>, fn(Arc<MockBackend>) -> Result<(), String>), String>;
+    type MockOpenResult = Result<
+        (
+            Arc<MockBackend>,
+            fn(Arc<MockBackend>) -> Result<(), AgentFailure>,
+        ),
+        AgentFailure,
+    >;
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -396,47 +390,41 @@ mod tests {
     }
 
     #[test]
-    fn redaction_is_single_pass_and_covers_raw_and_debug_escaped_values() {
+    fn backend_error_suppresses_message_and_source() {
+        let error = aci_edge_sandboxes::Error::backend_error("secret")
+            .with_source(std::io::Error::other("secret source"));
         assert_eq!(
-            redact_sensitive("a [redacted] a".into(), &["a".into()]),
-            "[redacted] [red[redacted]cted] [redacted]"
-        );
-        let secret = "quote\" slash\\\n".to_string();
-        let message = format!("raw={secret}; debug={secret:?}; ref=private/image");
-        let result = redact_sensitive(message, &[secret.clone(), "private/image".into()]);
-        assert!(!result.contains(&secret));
-        assert!(!result.contains("quote\\\""));
-        assert!(!result.contains("private/image"));
-        assert_eq!(
-            result,
-            "raw=[redacted]; debug=\"[redacted]\"; ref=[redacted]"
+            backend_error(&error),
+            "backend_error (backend details suppressed: may contain command or image)"
         );
     }
 
     #[test]
     fn agent_initialization_failure_reports_uncertain_cleanup_and_redacts_values() {
         let fixture = Fixture::new();
-        let secret = "secret\"argument";
-        let image = "private.example/image";
-        let mut args = fixture.args("--image", image.into());
-        args.push(secret.into());
-        let result = run_with(
-            args,
-            || Ok(()),
-            fixture.trust,
-            |_| -> MockOpenResult {
-                Err(format!(
-                    "startup failure: raw={secret}; debug={secret:?}; image={image}"
+        for (secret, image) in [("e", "e"), ("secret\"argument", "private.example/image")] {
+            let mut args = fixture.args("--image", image.into());
+            args.push(secret.into());
+            let result = run_with(
+                args,
+                || Ok(()),
+                fixture.trust,
+                |_| -> MockOpenResult {
+                    Err(AgentFailure::Backend(
+                        aci_edge_sandboxes::Error::backend_error(format!(
+                            "startup failure: raw={secret}; debug={secret:?}; image={image}"
+                        )),
+                    ))
+                },
+                || Ok((std::io::sink(), std::io::sink())),
+            );
+            assert_eq!(
+                result,
+                Err(RunnerError::Runtime(
+                    "open agent: backend_error (backend details suppressed: may contain command or image); agent host cleanup status may be unknown".into()
                 ))
-            },
-            || Ok((std::io::sink(), std::io::sink())),
-        );
-        assert_eq!(
-            result,
-            Err(RunnerError::Runtime(
-                "open agent: startup failure: raw=[redacted]; debug=\"[redacted]\"; image=[redacted]; agent host cleanup status may be unknown".into()
-            ))
-        );
+            );
+        }
     }
 
     #[test]
@@ -516,7 +504,8 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(setup_error.to_string().contains("setup:"), "{setup_error}");
+        assert!(setup_error.to_string().contains("setup: malformed_request (backend details suppressed: may contain command or image)"), "{setup_error}");
+        assert!(!setup_error.to_string().contains("invalid reference"));
         assert!(!setup_error.to_string().contains("cleanup status"));
 
         let output_error = run_with(

@@ -35,7 +35,7 @@ impl Arguments {
                 name,
                 "--bundle" | "--state-root" | "--image" | "--image-file"
             ) {
-                return Err(format!("unknown option: {name}"));
+                return Err("unknown option (value suppressed)".into());
             }
             let value = args
                 .next()
@@ -295,7 +295,7 @@ mod tests {
         let state = absolute_path("state");
         for (tail, expected) in [
             (&[][..], "missing -- separator before the guest program"),
-            (&["true"][..], "unknown option: true"),
+            (&["true"][..], "unknown option (value suppressed)"),
             (&["--"][..], "a nonempty guest program is required after --"),
             (
                 &["--", ""][..],
@@ -424,7 +424,7 @@ mod tests {
                     "--",
                     "true",
                 ],
-                "unknown option: --unknown",
+                "unknown option (value suppressed)",
             ),
         ] {
             assert_eq!(parse(&values), Err(expected.into()), "{values:?}");

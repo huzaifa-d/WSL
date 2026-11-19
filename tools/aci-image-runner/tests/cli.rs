@@ -120,3 +120,32 @@ fn cli_uses_the_production_host_check_and_manifest_pin() {
     assert!(output.stdout.is_empty());
     assert_eq!(String::from_utf8(output.stderr).unwrap(), expected);
 }
+
+#[test]
+fn cli_missing_bundle_preserves_os_error_with_one_character_argument() {
+    if !matches!(supported_host(), Ok(true)) {
+        eprintln!("skipped: production bundle check requires a native Windows x64 host");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("missing-bundle");
+    let manifest = bundle.join("SOURCE-MANIFEST.json");
+    let cause = std::fs::File::open(&manifest).unwrap_err();
+    let output = Command::new(env!("CARGO_BIN_EXE_aci-image-runner"))
+        .arg("--bundle")
+        .arg(&bundle)
+        .arg("--state-root")
+        .arg(root.path().join("state"))
+        .args(["--image", "alpine", "--", "e"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "aci-image-runner: cannot open {}: {cause}\n",
+            manifest.display()
+        )
+    );
+}

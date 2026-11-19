@@ -9,14 +9,28 @@ use std::time::{Duration, Instant};
 use aci_edge_sandboxes::{Canceller, ExecOutcome, Execution};
 
 enum WorkerError {
-    Failed(String),
+    Io(io::Error),
+    Backend(aci_edge_sandboxes::Error),
     Panicked,
 }
 
-fn describe_error(stage: &str, error: WorkerError, redact: &impl Fn(String) -> String) -> String {
+fn describe_error(stage: &str, error: WorkerError) -> String {
     match error {
-        WorkerError::Failed(detail) => format!("{stage} failed: {}", redact(detail)),
+        WorkerError::Io(error) => format!("{stage} failed: {}", io_diagnostic(&error)),
+        WorkerError::Backend(error) => format!("{stage} failed: {}", crate::backend_error(&error)),
         WorkerError::Panicked => format!("{stage} panicked"),
+    }
+}
+
+fn io_diagnostic(error: &io::Error) -> String {
+    // Only the native OS-error representation has a system-generated message.
+    if error.raw_os_error().is_some() {
+        format!("{:?}: {error}", error.kind())
+    } else {
+        format!(
+            "{:?} (I/O details suppressed: may contain command or image)",
+            error.kind()
+        )
     }
 }
 
@@ -27,7 +41,7 @@ fn drain<R: Read, W: Write>(mut reader: R, mut writer: W) -> Result<(), WorkerEr
     }));
     match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(WorkerError::Failed(error.to_string())),
+        Ok(Err(error)) => Err(WorkerError::Io(error)),
         Err(_) => Err(WorkerError::Panicked),
     }
 }
@@ -61,9 +75,7 @@ fn request_cancel(
         Box::new(move || {
             let result = catch_unwind(AssertUnwindSafe(|| canceller.cancel()))
                 .map_err(|_| WorkerError::Panicked)
-                .and_then(|result| {
-                    result.map_err(|error| WorkerError::Failed(crate::error_chain(&error)))
-                });
+                .and_then(|result| result.map_err(WorkerError::Backend));
             drop(canceller);
             let _ = tx.send(Event::Cancel(result));
         }),
@@ -76,16 +88,15 @@ pub(crate) fn forward<W: Write + Send + 'static, E: Write + Send + 'static>(
     stdout: W,
     stderr: E,
 ) -> Result<ExecOutcome, String> {
-    forward_with_spawner(execution, stdout, stderr, spawn, &|message| message).into_result()
+    forward_with_spawner(execution, stdout, stderr, spawn).into_result()
 }
 
-pub(crate) fn forward_redacted<W: Write + Send + 'static, E: Write + Send + 'static>(
+pub(crate) fn forward_safe<W: Write + Send + 'static, E: Write + Send + 'static>(
     execution: Execution,
     stdout: W,
     stderr: E,
-    redact: &impl Fn(String) -> String,
 ) -> Forward {
-    forward_with_spawner(execution, stdout, stderr, spawn, redact)
+    forward_with_spawner(execution, stdout, stderr, spawn)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,34 +130,27 @@ impl Forward {
         self.controls_done() && self.pending_output == 0 && self.workers.is_empty()
     }
 
-    fn poll(&mut self, redact: &impl Fn(String) -> String) {
+    fn poll(&mut self) {
         if let Ok(event) = self.rx.recv_timeout(Duration::from_millis(20)) {
             match event {
                 Event::Output(name, result) => {
                     self.pending_output -= 1;
                     if let Err(error) = result {
-                        self.errors.push(describe_error(
-                            &format!("{name} forwarding"),
-                            error,
-                            redact,
-                        ));
+                        self.errors
+                            .push(describe_error(&format!("{name} forwarding"), error));
                     }
                 }
                 Event::Wait(result) => {
                     self.waiting = false;
                     match result {
                         Ok(value) => self.outcome = Some(value),
-                        Err(error) => {
-                            self.errors
-                                .push(describe_error("execution wait", error, redact))
-                        }
+                        Err(error) => self.errors.push(describe_error("execution wait", error)),
                     }
                 }
                 Event::Cancel(result) => {
                     self.cancelling = false;
                     if let Err(error) = result {
-                        self.errors
-                            .push(describe_error("cancellation", error, redact));
+                        self.errors.push(describe_error("cancellation", error));
                     }
                 }
             }
@@ -180,10 +184,10 @@ impl Forward {
         }
     }
 
-    pub(crate) fn finish_after_stop(&mut self, redact: &impl Fn(String) -> String) -> bool {
+    pub(crate) fn finish_after_stop(&mut self) -> bool {
         let deadline = Instant::now() + FAILURE_GRACE;
         while !self.all_done() && Instant::now() < deadline {
-            self.poll(redact);
+            self.poll();
         }
         let controls_done = self.controls_done();
         if !controls_done {
@@ -221,7 +225,6 @@ fn forward_with_spawner<W: Write + Send + 'static, E: Write + Send + 'static>(
     stdout: W,
     stderr: E,
     spawn: impl Fn(&str, Job) -> io::Result<Worker>,
-    redact: &impl Fn(String) -> String,
 ) -> Forward {
     let canceller = execution.canceller();
     let stdout_pipe = execution.take_stdout();
@@ -258,7 +261,7 @@ fn forward_with_spawner<W: Write + Send + 'static, E: Write + Send + 'static>(
                     Err(error) => forward.errors.push(format!(
                         "could not start {} forwarding: {}",
                         $name,
-                        redact(error.to_string())
+                        io_diagnostic(&error)
                     )),
                 }
             }
@@ -273,9 +276,7 @@ fn forward_with_spawner<W: Write + Send + 'static, E: Write + Send + 'static>(
         Box::new(move || {
             let result = catch_unwind(AssertUnwindSafe(|| execution.wait()))
                 .map_err(|_| WorkerError::Panicked)
-                .and_then(|result| {
-                    result.map_err(|error| WorkerError::Failed(crate::error_chain(&error)))
-                });
+                .and_then(|result| result.map_err(WorkerError::Backend));
             let _ = wait_tx.send(Event::Wait(result));
         }),
     ) {
@@ -286,7 +287,7 @@ fn forward_with_spawner<W: Write + Send + 'static, E: Write + Send + 'static>(
         Err(error) => {
             forward.errors.push(format!(
                 "could not start execution wait; outcome unknown: {}",
-                redact(error.to_string())
+                io_diagnostic(&error)
             ));
         }
     }
@@ -303,7 +304,7 @@ fn forward_with_spawner<W: Write + Send + 'static, E: Write + Send + 'static>(
                 }
                 Err(error) => forward.errors.push(format!(
                     "could not start cancellation: {}",
-                    redact(error.to_string())
+                    io_diagnostic(&error)
                 )),
             }
         }
@@ -317,7 +318,7 @@ fn forward_with_spawner<W: Write + Send + 'static, E: Write + Send + 'static>(
             ));
             break;
         }
-        forward.poll(redact);
+        forward.poll();
     }
     forward
 }
@@ -690,7 +691,7 @@ mod tests {
                 error.contains(if fail_stdout { "stdout" } else { "stderr" }),
                 "{error}"
             );
-            assert!(error.contains("injected writer error"), "{error}");
+            assert!(error.contains("forwarding failed: Other"), "{error}");
             assert!(cancel_calls.load(Ordering::SeqCst) > 0);
         }
     }
@@ -716,7 +717,7 @@ mod tests {
                 error.contains(if fail_stdout { "stdout" } else { "stderr" }),
                 "{error}"
             );
-            assert!(error.contains("injected writer error"), "{error}");
+            assert!(error.contains("forwarding failed: Other"), "{error}");
         }
     }
 
@@ -736,7 +737,7 @@ mod tests {
                 error.contains(if fail_stdout { "stdout" } else { "stderr" }),
                 "{error}"
             );
-            assert!(error.contains("injected flush error"), "{error}");
+            assert!(error.contains("forwarding failed: Other"), "{error}");
             assert!(cancel_calls.load(Ordering::SeqCst) > 0);
         }
     }
@@ -753,8 +754,11 @@ mod tests {
                 }
             });
             let error = result.unwrap_err();
-            assert!(error.contains("injected writer error"), "{error}");
-            assert!(error.contains("injected cancel error"), "{error}");
+            assert!(error.contains("forwarding failed: Other"), "{error}");
+            assert!(
+                error.contains("cancellation failed: backend_error"),
+                "{error}"
+            );
             assert!(cancel_calls.load(Ordering::SeqCst) > 0);
         }
     }
@@ -780,8 +784,11 @@ mod tests {
                 }
             });
             let error = result.unwrap_err();
-            assert!(error.contains("injected writer error"), "{error}");
-            assert!(error.contains("injected cancel error"), "{error}");
+            assert!(error.contains("forwarding failed: Other"), "{error}");
+            assert!(
+                error.contains("cancellation failed: backend_error"),
+                "{error}"
+            );
             assert!(cancel_calls.load(Ordering::SeqCst) > 0);
         }
     }
@@ -790,9 +797,15 @@ mod tests {
     fn cancellation_and_wait_errors_are_not_lost() {
         let (execution, cancel_calls) = interleaved(false, true, true);
         let error = finish(move || forward(execution, Fails, io::sink())).unwrap_err();
-        assert!(error.contains("injected writer error"), "{error}");
-        assert!(error.contains("injected cancel error"), "{error}");
-        assert!(error.contains("injected wait error"), "{error}");
+        assert!(error.contains("forwarding failed: Other"), "{error}");
+        assert!(
+            error.contains("cancellation failed: backend_error"),
+            "{error}"
+        );
+        assert!(
+            error.contains("execution wait failed: backend_error"),
+            "{error}"
+        );
         assert!(cancel_calls.load(Ordering::SeqCst) > 0);
     }
 
@@ -800,8 +813,11 @@ mod tests {
     fn failed_cancellation_with_no_backend_completion_is_bounded() {
         let (execution, cancel_calls) = interleaved(true, true, false);
         let error = finish(move || forward(execution, Fails, io::sink())).unwrap_err();
-        assert!(error.contains("injected writer error"), "{error}");
-        assert!(error.contains("injected cancel error"), "{error}");
+        assert!(error.contains("forwarding failed: Other"), "{error}");
+        assert!(
+            error.contains("cancellation failed: backend_error"),
+            "{error}"
+        );
         assert!(
             error.contains("outcome or stream/cancellation completion is unknown"),
             "{error}"
@@ -821,8 +837,14 @@ mod tests {
             delay_cancel_until_done: false,
         });
         let error = finish(move || forward(execution, io::sink(), io::sink())).unwrap_err();
-        assert!(error.contains("injected immediate wait error"), "{error}");
-        assert!(error.contains("injected cancel error"), "{error}");
+        assert!(
+            error.contains("execution wait failed: backend_error"),
+            "{error}"
+        );
+        assert!(
+            error.contains("cancellation failed: backend_error"),
+            "{error}"
+        );
         assert!(error.contains("unknown"), "{error}");
     }
 
@@ -834,7 +856,7 @@ mod tests {
             ..Default::default()
         }));
         let error = finish(move || forward(execution, FlushFails, io::sink())).unwrap_err();
-        assert!(error.contains("injected flush error"), "{error}");
+        assert!(error.contains("forwarding failed: Other"), "{error}");
         assert!(error.contains("guest exited with status 7"), "{error}");
     }
 
@@ -844,15 +866,84 @@ mod tests {
             stdout: vec![1],
             ..Default::default()
         }));
-        let error = finish(move || {
-            forward_redacted(execution, Fails, io::sink(), &|message| {
-                crate::redact_sensitive(message, &["e".into()])
-            })
-            .into_result()
-        })
-        .unwrap_err();
+        let error =
+            finish(move || forward_safe(execution, Fails, io::sink()).into_result()).unwrap_err();
         assert!(error.contains("stdout forwarding failed:"), "{error}");
         assert!(!error.contains("injected writer error"), "{error}");
+    }
+
+    #[test]
+    fn io_diagnostics_distinguish_os_and_untrusted_errors() {
+        let os_error = io::Error::from_raw_os_error(2);
+        assert_eq!(
+            io_diagnostic(&os_error),
+            format!("{:?}: {os_error}", os_error.kind())
+        );
+        for secret in ["e", "private\"argument\\line\n"] {
+            let detail = format!("raw={secret}; debug={secret:?}");
+            let error = io::Error::other(detail);
+            assert_eq!(
+                io_diagnostic(&error),
+                "Other (I/O details suppressed: may contain command or image)"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_worker_errors_suppress_raw_debug_and_source_details() {
+        for secret in ["e", "private\"argument\\line\n"] {
+            for stage in ["execution wait", "cancellation"] {
+                let detail = format!("raw={secret}; debug={secret:?}");
+                let error =
+                    Error::backend_error(detail.clone()).with_source(io::Error::other(detail));
+                assert_eq!(
+                    describe_error(stage, WorkerError::Backend(error)),
+                    format!(
+                        "{stage} failed: backend_error (backend details suppressed: may contain command or image)"
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn panic_hook_reports_caught_worker_panics_without_payload() {
+        const CHILD: &str = "ACI_RUNNER_PANIC_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            crate::install_panic_hook();
+            struct PanicWriter;
+            impl Write for PanicWriter {
+                fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                    let secret = "private\"argument\\line\n";
+                    panic!("raw={secret}; debug={secret:?}");
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+            let error = drain(&b"data"[..], PanicWriter).err().unwrap();
+            eprintln!("{}", describe_error("stdout forwarding", error));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "streams::tests::panic_hook_reports_caught_worker_panics_without_payload",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("details suppressed: may contain command or image"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("streams.rs:"), "{stderr}");
+        assert!(stderr.contains("stdout forwarding panicked"), "{stderr}");
+        assert!(!stderr.contains("raw="), "{stderr}");
+        assert!(!stderr.contains("debug="), "{stderr}");
     }
 
     #[test]
@@ -865,24 +956,18 @@ mod tests {
         ] {
             let (execution, _) = interleaved(true, true, false);
             let error = finish(move || {
-                forward_with_spawner(
-                    execution,
-                    Fails,
-                    io::sink(),
-                    |name, job| {
-                        if name == failed_thread {
-                            Err(io::Error::other("injected thread startup error"))
-                        } else {
-                            spawn(name, job)
-                        }
-                    },
-                    &|message| message,
-                )
+                forward_with_spawner(execution, Fails, io::sink(), |name, job| {
+                    if name == failed_thread {
+                        Err(io::Error::other("injected thread startup error"))
+                    } else {
+                        spawn(name, job)
+                    }
+                })
                 .into_result()
             })
             .unwrap_err();
             assert!(
-                error.contains("injected thread startup error"),
+                error.contains("Other (I/O details suppressed: may contain command or image)"),
                 "{failed_thread}: {error}"
             );
             assert!(error.contains("unknown"), "{failed_thread}: {error}");
