@@ -151,7 +151,11 @@ If a call hangs, the runner may be unable to report an ID or cleanup outcome.
 Runner-generated host and bundle diagnostics retain their paths and OS errors.
 Agent and backend errors instead report the operation and stable error code but
 suppress their messages and causes, since those can contain the image reference
-or guest arguments, including escaped or very short values. Stream failures
+or guest arguments, including escaped or very short values. Different native
+initialization failures with the same code may therefore be indistinguishable.
+An execution wait or agent close error can conceal a release failure; its
+diagnostic reports that the outcome or cleanup status may be unknown rather
+than inferring a cause or guest status from suppressed text. Stream failures
 report their stage and I/O kind, preserving OS-generated diagnostics when
 available, but suppress other potentially sensitive details. A process-wide
 panic hook explicitly reports a panic and its source location while suppressing

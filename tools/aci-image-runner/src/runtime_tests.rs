@@ -195,7 +195,12 @@ impl ExecControl for GatedControl {
         drop(gate);
         drop(self.streams.lock().unwrap().take());
         self.state.lock().unwrap().events.push("wait-end");
-        Err(Error::backend_error("late wait failure"))
+        let detail = self.state.lock().unwrap().detail.clone();
+        Err(
+            Error::backend_error(detail).with_source(Error::backend_error(
+                "the agent library could not release the handle",
+            )),
+        )
     }
 
     fn cancel(&self) -> aci_edge_sandboxes::Result<()> {
@@ -960,6 +965,64 @@ fn primary_and_cleanup_errors_redact_raw_and_escaped_guest_values() {
     let state = state.lock().unwrap();
     assert!(!state.events.contains(&"deprovision"));
     assert!(error.contains(state.id.as_ref().unwrap()));
+}
+
+#[test]
+fn wait_and_close_failures_report_uncertainty_without_guessing_outcome() {
+    for (wait_detail, close_detail) in [
+        (
+            "the execution exited with status 7, but the agent library cannot release it; e",
+            "cannot close the agent host; release failure: e",
+        ),
+        (
+            "connection lost; e",
+            "the agent host closed, but an execution is still held; e",
+        ),
+        (
+            "the execution exited with status 7, but the agent library cannot release it; private\"secret",
+            "cannot close the agent host; release failure: private\"secret",
+        ),
+    ] {
+        let state = Arc::new(Mutex::new(State {
+            faults: vec!["close"],
+            detail: format!("{wait_detail}; {close_detail}"),
+            gate: Some(Gate::new(CancelBehavior::EndAfterStop)),
+            ..State::default()
+        }));
+        let error = invoke_with_command(
+            state.clone(),
+            ("--image", "example".into()),
+            FailWriter,
+            io::sink(),
+            vec!["printf".into(), "e".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("execution wait failed: backend_error"),
+            "{error}"
+        );
+        assert!(
+            error.contains("execution outcome and release status may be unknown"),
+            "{error}"
+        );
+        assert!(error.contains("close agent: backend_error"), "{error}");
+        assert!(
+            error.contains(
+                "agent host close or execution release may have failed; cleanup status is unknown"
+            ),
+            "{error}"
+        );
+        assert!(!error.contains(wait_detail), "{error}");
+        assert!(!error.contains(close_detail), "{error}");
+        assert!(!error.contains("status 7"), "{error}");
+        assert!(!error.contains("private\"secret"), "{error}");
+        let state = state.lock().unwrap();
+        assert!(error.contains(state.id.as_ref().unwrap()));
+        assert!(position(&state.events, "stop") < position(&state.events, "wait-end"));
+        assert!(position(&state.events, "control-drop") < position(&state.events, "deprovision"));
+        assert!(position(&state.events, "deprovision") < position(&state.events, "close"));
+    }
 }
 
 #[test]

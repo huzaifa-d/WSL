@@ -144,7 +144,12 @@ impl Forward {
                     self.waiting = false;
                     match result {
                         Ok(value) => self.outcome = Some(value),
-                        Err(error) => self.errors.push(describe_error("execution wait", error)),
+                        Err(error) => {
+                            self.errors.push(format!(
+                                "{}; execution outcome and release status may be unknown",
+                                describe_error("execution wait", error)
+                            ));
+                        }
                     }
                 }
                 Event::Cancel(result) => {

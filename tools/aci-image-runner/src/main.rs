@@ -215,6 +215,14 @@ where
         Image::Reference(reference) => ImageSource::Reference(reference),
         Image::File(path) => ImageSource::Path(path),
     };
+    // ImageSource::validate is local to the pinned model and does not echo the image.
+    image.validate("setup defaults.image").map_err(|error| {
+        RunnerError::Runtime(format!(
+            "setup: {}: {}",
+            error.code().as_str(),
+            error.message()
+        ))
+    })?;
     config.setup = config
         .setup
         .with_defaults(SandboxDefaults::default().with_image(image));
@@ -248,7 +256,15 @@ where
             "{detail}; close agent skipped: backend retained until process exit; late execution and close errors cannot be collected"
         )));
     }
-    let closed = close(backend).map_err(|error| error.diagnostic());
+    let closed = close(backend).map_err(|error| match error {
+        AgentFailure::Backend(error) => format!(
+            "{}; agent host close or execution release may have failed; cleanup status is unknown",
+            backend_error(&error)
+        ),
+        AgentFailure::StillOwned => {
+            "agent backend still has owners; cleanup status is unknown".into()
+        }
+    });
     match (lifecycle.result, closed) {
         (Ok(completed), Ok(())) => Ok(completed.exit_code),
         (Err(error), Ok(())) => Err(RunnerError::Runtime(error)),
@@ -428,6 +444,38 @@ mod tests {
     }
 
     #[test]
+    fn same_code_initialization_errors_remain_indistinguishable_and_secret_safe() {
+        let fixture = Fixture::new();
+        let messages = [
+            "the agent library's sandbox ABI is 2, expected 3",
+            "native error raw=private\"image; debug=\"private\\\"image\"",
+        ];
+        let mut results = Vec::new();
+        for message in messages {
+            let result = run_with(
+                fixture.args("--image", "private\"image".into()),
+                || Ok(()),
+                fixture.trust,
+                |_| -> MockOpenResult {
+                    Err(AgentFailure::Backend(
+                        aci_edge_sandboxes::Error::backend_unavailable(message),
+                    ))
+                },
+                || Ok((std::io::sink(), std::io::sink())),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!result.contains(message), "{result}");
+            assert!(!result.contains("private\"image"), "{result}");
+            assert!(!result.contains("private\\\"image"), "{result}");
+            results.push(result);
+        }
+        assert_eq!(results[0], results[1]);
+        assert!(results[0].contains("open agent: backend_unavailable"));
+        assert!(results[0].contains("agent host cleanup status may be unknown"));
+    }
+
+    #[test]
     fn actual_agent_constructor_failure_reports_uncertain_cleanup() {
         let fixture = Fixture::new();
         let error = run(
@@ -504,7 +552,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(setup_error.to_string().contains("setup: malformed_request (backend details suppressed: may contain command or image)"), "{setup_error}");
+        assert_eq!(
+            setup_error,
+            RunnerError::Runtime("setup: malformed_request: setup defaults.image.reference must be a nonempty image reference without whitespace or control characters".into())
+        );
         assert!(!setup_error.to_string().contains("invalid reference"));
         assert!(!setup_error.to_string().contains("cleanup status"));
 
