@@ -69,6 +69,57 @@ succeed, the runner returns the guest exit status.
 The state root contains agent state and an image cache. The runner does not
 delete the user-supplied state root or shared cache.
 
+## Opt-in OCI layer acceptance test
+
+The test uses the real runner and approved bundle on Windows x64/WHP. It
+downloads a digest-pinned public Azure Linux amd64 base image from Microsoft
+Container Registry, checks its manifest, config, compressed layer and
+uncompressed layer digests, and adds two locally generated OCI layers. No
+Docker daemon or credentials are required. A temporary unauthenticated registry
+is bound only to `127.0.0.1`; it is stopped when the runner returns. The script
+uses a fresh tag and creates a new state directory for each run beneath the
+specified existing, absolute scratch directory. It does not modify the bundle
+or an existing guest image.
+
+After building the runner as above, choose a user-owned scratch directory and
+run:
+
+```powershell
+$scratch = Join-Path $root 'oci-tests'
+New-Item -ItemType Directory -Path $scratch | Out-Null
+python tools\aci-image-runner\tests\oci_layers.py --bundle $bundle --runner $runner --scratch $scratch
+if ($LASTEXITCODE -ne 0) { throw 'OCI layer acceptance test failed' }
+foreach ($mutant in @('missing-added', 'wrong-replacement', 'missing-delete', 'missing-opaque')) {
+    python tools\aci-image-runner\tests\oci_layers.py --bundle $bundle --runner $runner --scratch $scratch --mutant $mutant
+    if ($LASTEXITCODE -ne 0) { throw "OCI layer mutant did not fail as expected: $mutant" }
+}
+```
+
+The script inspects both generated tar archives before starting the runner. The
+lower layer contains files to replace, remove and hide; the upper layer contains
+the replacement, addition, `.wh.deleted` and `opaque/.wh..wh..opq`. The
+opaque marker follows an upper-layer sibling in the tar to verify that it hides
+lower entries, including nested descendants, without hiding the sibling. The
+guest also checks that the markers themselves are absent and an unrelated lower
+file remains. Success requires exit code zero, stdout exactly `OCI_LAYERS_OK`
+followed by a newline, and empty stderr. Each mutant succeeds as a *test* only
+when the guest exits 1 with its exact expected failure on stderr and no stdout.
+
+Each run retains `fixture.json`, `manifest.json`, the inspected `lower.tar` and
+`upper.tar`, the exact runner argument vector in `command.json`, separate
+`stdout` and `stderr` files, and agent state in its own scratch directory.
+The fixture reports content and manifest SHA-256 digests. It needs network
+access only to fetch the public base; the agent pulls the test image from the
+local registry. The normal native-call hang and cleanup limitations below still
+apply; this test does not impose a whole-process timeout.
+
+The fixture's local construction and registry checks can also run without an
+agent or network:
+
+```powershell
+python -m unittest discover -s tools\aci-image-runner\tests -p test_oci_layers.py
+```
+
 ## Output and lifecycle limitations
 
 The runner forwards guest stdout and stderr separately, without modifying their
