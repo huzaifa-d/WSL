@@ -2,11 +2,20 @@
 
 mod arguments;
 mod bundle;
+mod lifecycle;
+mod output;
+mod streams;
 
-use arguments::Arguments;
+#[cfg(test)]
+mod runtime_tests;
+use aci_edge_sandboxes::agent::{AgentBackend, AgentConfig, SandboxDefaults};
+use aci_edge_sandboxes::{AciEdgeSandbox, Backend, ImageSource};
+use arguments::{Arguments, Image};
 use bundle::BundleTrust;
 use std::ffi::OsString;
 use std::fmt;
+use std::io::Write;
+use std::sync::Arc;
 
 const ERROR_EXIT_CODE: i32 = 1;
 
@@ -15,17 +24,17 @@ enum RunnerError {
     Arguments(String),
     Host(String),
     Bundle(String),
-    NotImplemented,
+    Runtime(String),
 }
 
 impl fmt::Display for RunnerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Arguments(message) | Self::Host(message) | Self::Bundle(message) => {
+            Self::Arguments(message)
+            | Self::Host(message)
+            | Self::Bundle(message)
+            | Self::Runtime(message) => {
                 write!(formatter, "aci-image-runner: {message}")
-            }
-            Self::NotImplemented => {
-                write!(formatter, "aci-image-runner: execution is not implemented")
             }
         }
     }
@@ -145,23 +154,150 @@ fn run(
     args: impl IntoIterator<Item = OsString>,
     host_check: impl FnOnce() -> Result<(), String>,
     trust: BundleTrust,
-) -> Result<(), RunnerError> {
+) -> Result<i32, RunnerError> {
+    run_with(
+        args,
+        host_check,
+        trust,
+        |config| {
+            let backend = Arc::new(AgentBackend::new(config).map_err(|error| error_chain(&error))?);
+            Ok((backend, |backend: Arc<AgentBackend>| {
+                Arc::try_unwrap(backend)
+                    .map_err(|_| "agent backend still has owners".to_owned())?
+                    .close()
+                    .map_err(|error| error_chain(&error))
+            }))
+        },
+        output::writers,
+    )
+}
+
+fn run_with<B, C, W, E>(
+    args: impl IntoIterator<Item = OsString>,
+    host_check: impl FnOnce() -> Result<(), String>,
+    trust: BundleTrust,
+    open: impl FnOnce(AgentConfig) -> Result<(Arc<B>, C), String>,
+    prepare_output: impl FnOnce() -> Result<(W, E), String>,
+) -> Result<i32, RunnerError>
+where
+    B: Backend + 'static,
+    C: FnOnce(Arc<B>) -> Result<(), String>,
+    W: Write + Send + 'static,
+    E: Write + Send + 'static,
+{
     let args = Arguments::parse(args).map_err(RunnerError::Arguments)?;
-    host_check().map_err(RunnerError::Host)?;
-    let _config = trust
+    let mut sensitive = args.command.clone();
+    if let Image::Reference(reference) = &args.image {
+        sensitive.push(reference.clone());
+    }
+    let redact = |message: String| redact_sensitive(message, &sensitive);
+    host_check().map_err(|error| RunnerError::Host(redact(error)))?;
+    let mut config = trust
         .agent_config(&args.bundle, &args.state_root)
-        .map_err(RunnerError::Bundle)?;
-    Err(RunnerError::NotImplemented)
+        .map_err(|error| RunnerError::Bundle(redact(error)))?;
+    let image = match args.image {
+        Image::Reference(reference) => ImageSource::Reference(reference),
+        Image::File(path) => ImageSource::Path(path),
+    };
+    config.setup = config
+        .setup
+        .with_defaults(SandboxDefaults::default().with_image(image));
+    config
+        .setup
+        .validate()
+        .map_err(|error| RunnerError::Runtime(format!("setup: {}", redact(error_chain(&error)))))?;
+    let (stdout, stderr) = prepare_output()
+        .map_err(|error| RunnerError::Runtime(format!("output: {}", redact(error))))?;
+    let (backend, close) = open(config)
+        .map_err(|error| RunnerError::Runtime(format!("open agent: {}", redact(error))))?;
+    let client = AciEdgeSandbox::from_shared(backend.clone());
+    let lifecycle = lifecycle::execute(&client, args.command, stdout, stderr, &redact);
+    drop(client);
+    if !lifecycle.backend_safe_to_close {
+        // Dropping AgentBackend would implicitly close the host while its control worker is active.
+        std::mem::forget(backend);
+        let detail = match lifecycle.result {
+            Ok(completed) => format!(
+                "sandbox {}: guest exited with status {}",
+                completed.sandbox_id, completed.exit_code
+            ),
+            Err(error) => error,
+        };
+        return Err(RunnerError::Runtime(format!(
+            "{detail}; close agent skipped: backend retained until process exit; late execution and close errors cannot be collected"
+        )));
+    }
+    let closed = close(backend).map_err(redact);
+    match (lifecycle.result, closed) {
+        (Ok(completed), Ok(())) => Ok(completed.exit_code),
+        (Err(error), Ok(())) => Err(RunnerError::Runtime(error)),
+        (Ok(completed), Err(error)) if completed.exit_code != 0 => {
+            Err(RunnerError::Runtime(format!(
+                "sandbox {}: guest exited with status {}; close agent: {error}",
+                completed.sandbox_id, completed.exit_code,
+            )))
+        }
+        (Ok(completed), Err(error)) => Err(RunnerError::Runtime(format!(
+            "sandbox {}: close agent: {error}",
+            completed.sandbox_id
+        ))),
+        (Err(primary), Err(error)) => Err(RunnerError::Runtime(format!(
+            "{primary}; close agent: {error}"
+        ))),
+    }
+}
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
+fn redact_sensitive(message: String, values: &[String]) -> String {
+    let mut patterns: Vec<String> = values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .flat_map(|value| {
+            let escaped = format!("{value:?}");
+            [value.clone(), escaped[1..escaped.len() - 1].to_owned()]
+        })
+        .collect();
+    patterns.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    patterns.dedup();
+    let mut result = String::new();
+    let mut remaining = message.as_str();
+    while !remaining.is_empty() {
+        if let Some(pattern) = patterns
+            .iter()
+            .find(|pattern| remaining.starts_with(pattern.as_str()))
+        {
+            result.push_str("[redacted]");
+            remaining = &remaining[pattern.len()..];
+        } else {
+            let ch = remaining.chars().next().unwrap();
+            result.push(ch);
+            remaining = &remaining[ch.len_utf8()..];
+        }
+    }
+    result
 }
 
 fn main() {
-    if let Err(error) = run(
+    match run(
         std::env::args_os().skip(1),
         check_current_host,
         BundleTrust::approved(),
     ) {
-        eprintln!("{error}");
-        std::process::exit(ERROR_EXIT_CODE);
+        Ok(code) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(ERROR_EXIT_CODE);
+        }
     }
 }
 
@@ -206,12 +342,34 @@ mod tests {
                 "printf".into(),
                 "hello world".into(),
                 "a;$(touch nope)".into(),
-                "".into(),
+                "\"quoted\"".into(),
             ]
         }
 
-        fn run(&self) -> Result<(), RunnerError> {
-            run(self.args("--image", "alpine".into()), || Ok(()), self.trust)
+        fn run(&self) -> Result<i32, RunnerError> {
+            Self::run_fake(self.args("--image", "alpine".into()), || Ok(()), self.trust)
+        }
+
+        fn run_fake(
+            args: impl IntoIterator<Item = OsString>,
+            host_check: impl FnOnce() -> Result<(), String>,
+            trust: BundleTrust,
+        ) -> Result<i32, RunnerError> {
+            run_with(
+                args,
+                host_check,
+                trust,
+                |_| {
+                    Ok((
+                        Arc::new(aci_edge_sandboxes::testing::MockBackend::new()),
+                        |backend: Arc<aci_edge_sandboxes::testing::MockBackend>| {
+                            assert!(Arc::try_unwrap(backend).is_ok());
+                            Ok(())
+                        },
+                    ))
+                },
+                || Ok((std::io::sink(), std::io::sink())),
+            )
         }
 
         fn manifest(&self) -> PathBuf {
@@ -226,6 +384,39 @@ mod tests {
     fn decode(hex: &str) -> [u8; 32] {
         assert_eq!(hex.len(), 64);
         std::array::from_fn(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+    }
+
+    #[test]
+    fn redaction_is_single_pass_and_covers_raw_and_debug_escaped_values() {
+        assert_eq!(
+            redact_sensitive("a [redacted] a".into(), &["a".into()]),
+            "[redacted] [red[redacted]cted] [redacted]"
+        );
+        let secret = "quote\" slash\\\n".to_string();
+        let message = format!("raw={secret}; debug={secret:?}; ref=private/image");
+        let result = redact_sensitive(message, &[secret.clone(), "private/image".into()]);
+        assert!(!result.contains(&secret));
+        assert!(!result.contains("quote\\\""));
+        assert!(!result.contains("private/image"));
+        assert_eq!(
+            result,
+            "raw=[redacted]; debug=\"[redacted]\"; ref=[redacted]"
+        );
+    }
+
+    #[test]
+    fn empty_guest_argument_is_rejected_before_host_check() {
+        let fixture = Fixture::new();
+        for index in [8, 9, 10] {
+            let mut args = fixture.args("--image", "alpine".into());
+            args[index] = "".into();
+            assert_eq!(
+                run(args, || panic!("host check must not run"), fixture.trust),
+                Err(RunnerError::Arguments(
+                    "empty guest arguments are not supported".into()
+                ))
+            );
+        }
     }
 
     #[test]
@@ -346,12 +537,12 @@ mod tests {
         assert_eq!(error.to_string(), format!("aci-image-runner: {message}"));
         assert_eq!(ERROR_EXIT_CODE, 1);
         assert_eq!(
-            run(
+            Fixture::run_fake(
                 args(),
                 || check_windows_host("windows", "x86_64", || Ok(Some(native_amd64))),
                 fixture.trust,
             ),
-            Err(RunnerError::NotImplemented)
+            Ok(0)
         );
         assert_eq!(
             run(
@@ -433,7 +624,7 @@ mod tests {
     #[test]
     fn production_runner_refuses_tampered_manifest_and_library() {
         let fixture = Fixture::new();
-        assert_eq!(fixture.run(), Err(RunnerError::NotImplemented));
+        assert_eq!(fixture.run(), Ok(0));
 
         fs::write(fixture.manifest(), b"modified manifest").unwrap();
         assert_eq!(
@@ -507,11 +698,11 @@ mod tests {
     }
 
     #[test]
-    fn production_runner_accepts_both_image_forms_before_unimplemented_error() {
+    fn production_runner_accepts_both_image_forms() {
         let fixture = Fixture::new();
-        assert_eq!(fixture.run(), Err(RunnerError::NotImplemented));
+        assert_eq!(fixture.run(), Ok(0));
         assert_eq!(
-            run(
+            Fixture::run_fake(
                 fixture.args(
                     "--image-file",
                     fixture.dir.path().join("image.vhd").into_os_string()
@@ -519,7 +710,7 @@ mod tests {
                 || Ok(()),
                 fixture.trust,
             ),
-            Err(RunnerError::NotImplemented)
+            Ok(0)
         );
     }
 
@@ -553,7 +744,10 @@ mod tests {
                 "unsupported host",
             ),
             (RunnerError::Bundle("bad digest".into()), "bad digest"),
-            (RunnerError::NotImplemented, "execution is not implemented"),
+            (
+                RunnerError::Runtime("runtime failure".into()),
+                "runtime failure",
+            ),
         ] {
             assert_eq!(format!("{error}"), format!("aci-image-runner: {message}"));
         }
@@ -593,6 +787,6 @@ mod tests {
         for (path, permissions) in files {
             fs::set_permissions(path, permissions).unwrap();
         }
-        assert_eq!(result, Err(RunnerError::NotImplemented));
+        assert_eq!(result, Ok(0));
     }
 }

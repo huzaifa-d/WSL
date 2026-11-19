@@ -72,6 +72,9 @@ impl Arguments {
         if command.first().is_none_or(String::is_empty) {
             return Err("a nonempty guest program is required after --".into());
         }
+        if command.iter().skip(1).any(String::is_empty) {
+            return Err("empty guest arguments are not supported".into());
+        }
 
         Ok(Self {
             bundle: bundle.ok_or("--bundle is required")?,
@@ -133,7 +136,7 @@ mod tests {
             "printf",
             "hello world",
             "a;$(touch nope)",
-            "",
+            "\"quoted\"",
             "--image",
         ])
         .unwrap();
@@ -142,8 +145,40 @@ mod tests {
         assert_eq!(parsed.image, Image::Reference("alpine:latest".into()));
         assert_eq!(
             parsed.command,
-            vec!["printf", "hello world", "a;$(touch nope)", "", "--image"]
+            vec![
+                "printf",
+                "hello world",
+                "a;$(touch nope)",
+                "\"quoted\"",
+                "--image"
+            ]
         );
+    }
+
+    #[test]
+    fn rejects_empty_guest_arguments() {
+        let bundle = absolute_path("bundle");
+        let state = absolute_path("state");
+        for command in [
+            vec!["true", ""],
+            vec!["true", "value", ""],
+            vec!["true", "", "value"],
+        ] {
+            let mut values = vec![
+                "--bundle",
+                &bundle,
+                "--state-root",
+                &state,
+                "--image",
+                "alpine",
+                "--",
+            ];
+            values.extend(command);
+            assert_eq!(
+                parse(&values),
+                Err("empty guest arguments are not supported".into())
+            );
+        }
     }
 
     #[test]

@@ -73,6 +73,25 @@ fn cli_reports_argument_error_and_nonzero_exit() {
 }
 
 #[test]
+fn cli_rejects_empty_guest_argument_before_host_or_bundle_checks() {
+    let path = std::env::current_dir().unwrap().join("not-a-bundle");
+    let output = Command::new(env!("CARGO_BIN_EXE_aci-image-runner"))
+        .arg("--bundle")
+        .arg(&path)
+        .arg("--state-root")
+        .arg(&path)
+        .args(["--image", "alpine", "--", "true", ""])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "aci-image-runner: empty guest arguments are not supported\n"
+    );
+}
+
+#[test]
 fn cli_uses_the_production_host_check_and_manifest_pin() {
     let bundle = tempfile::tempdir().unwrap();
     let manifest = bundle.path().join("SOURCE-MANIFEST.json");
