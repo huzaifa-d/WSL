@@ -1,7 +1,13 @@
 # Copyright (C) Microsoft Corporation. All rights reserved.
 
 import gzip
+import http.server
 import json
+import os
+import pathlib
+import subprocess
+import sys
+import threading
 import unittest
 import urllib.error
 import urllib.request
@@ -91,27 +97,122 @@ class FixtureTests(unittest.TestCase):
         image, blobs, _ = oci_layers.make_fixture(*self.base(), "none")
         server, thread = oci_layers.serve_fixture(image, blobs, "test-tag")
         base = f"http://127.0.0.1:{server.server_port}"
+        opener = oci_layers.registry_opener()
         try:
-            with urllib.request.urlopen(base + "/v2/") as response:
+            with opener.open(base + "/v2/") as response:
                 self.assertEqual(response.read(), b"{}")
             for reference in ("test-tag", oci_layers.digest(image)):
                 request = urllib.request.Request(base + "/v2/fixture/manifests/" + reference)
-                with urllib.request.urlopen(request) as response:
+                with opener.open(request) as response:
                     self.assertEqual(response.read(), image)
                     self.assertEqual(response.headers["Docker-Content-Digest"], oci_layers.digest(image))
             key = next(iter(blobs))
             request = urllib.request.Request(base + "/v2/fixture/blobs/" + key, method="HEAD")
-            with urllib.request.urlopen(request) as response:
+            with opener.open(request) as response:
                 self.assertEqual(int(response.headers["Content-Length"]), len(blobs[key]))
                 self.assertEqual(response.read(), b"")
             with self.assertRaises(urllib.error.HTTPError) as error:
-                urllib.request.urlopen(base + "/v2/other/blobs/" + key)
+                opener.open(base + "/v2/other/blobs/" + key)
             self.assertEqual(error.exception.code, 404)
         finally:
             server.shutdown()
             server.server_close()
             thread.join()
         self.assertFalse(thread.is_alive())
+
+    def test_child_proxy_environment_is_isolated_without_mutating_input(self):
+        inherited = {
+            "HTTP_PROXY": "http://example.invalid",
+            "https_proxy": "http://example.invalid",
+            "ALL_PROXY": "http://example.invalid",
+            "NO_PROXY": "",
+            "Path": "preserved",
+        }
+        original = inherited.copy()
+        child = oci_layers.registry_child_environment(inherited)
+        self.assertEqual(inherited, original)
+        self.assertEqual(child["Path"], "preserved")
+        self.assertEqual(child["NO_PROXY"], "*")
+        self.assertFalse(any(key.lower() in ("http_proxy", "https_proxy", "all_proxy") for key in child))
+
+    def test_dangling_symlink_cases_require_exact_guest_failures(self):
+        for case, path in oci_layers.SYMLINK_CASES.items():
+            with self.subTest(case=case):
+                script = oci_layers.guest_script(case)
+                self.assertIn(f"'/{oci_layers.PREFIX}/{path}'", script)
+                self.assertIn(f'absent "$p/{path}" || fail {case}', script)
+                self.assertIn('[ ! -L "$1" ]', script)
+                result = subprocess.CompletedProcess([], 1, b"", f"FAIL:{case}\n".encode())
+                oci_layers.validate_result(result, "none", case)
+                for bad in (
+                    subprocess.CompletedProcess([], 0, b"OCI_LAYERS_OK\n", b""),
+                    subprocess.CompletedProcess([], 1, b"", b"FAIL:wrong\n"),
+                    subprocess.CompletedProcess([], 1, b"unexpected", result.stderr),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        oci_layers.validate_result(bad, "none", case)
+
+    def test_loopback_opener_bypasses_inherited_proxy(self):
+        class Trap(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.server.requests += 1
+                self.send_error(502)
+
+            def log_message(self, fmt, *args):
+                pass
+
+        image, blobs, _ = oci_layers.make_fixture(*self.base(), "none")
+        proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trap)
+        proxy.requests = 0
+        proxy_thread = threading.Thread(target=proxy.serve_forever)
+        proxy_thread.start()
+        try:
+            registry, registry_thread = oci_layers.serve_fixture(image, blobs, "proxy-test")
+            try:
+                env = {key: value for key, value in os.environ.items() if not key.lower().endswith("_proxy")}
+                env["HTTP_PROXY"] = f"http://127.0.0.1:{proxy.server_port}"
+                env["NO_PROXY"] = ""
+                url = f"http://127.0.0.1:{registry.server_port}/v2/"
+                control = """
+import sys, urllib.error, urllib.request
+try:
+    urllib.request.urlopen(sys.argv[1], timeout=5)
+except urllib.error.HTTPError as error:
+    assert error.code == 502
+else:
+    raise AssertionError('proxy positive control did not intercept request')
+"""
+                safe_opener = """
+import sys, oci_layers
+with oci_layers.registry_opener().open(sys.argv[1], timeout=5) as response:
+    assert response.read() == b'{}'
+"""
+                child_request = """
+import sys, urllib.request
+with urllib.request.urlopen(sys.argv[1], timeout=5) as response:
+    assert response.read() == b'{}'
+"""
+                def run(script, child_env):
+                    result = subprocess.run(
+                        [sys.executable, "-c", script, url],
+                        cwd=pathlib.Path(__file__).parent, env=child_env, capture_output=True, timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+
+                run(control, env)
+                self.assertEqual(proxy.requests, 1)
+                proxy.requests = 0
+                run(safe_opener, env)
+                run(child_request, oci_layers.registry_child_environment(env))
+                self.assertEqual(proxy.requests, 0)
+            finally:
+                registry.shutdown()
+                registry.server_close()
+                registry_thread.join()
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            proxy_thread.join()
 
 
 if __name__ == "__main__":

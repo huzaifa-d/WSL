@@ -8,6 +8,7 @@ import hashlib
 import http.server
 import io
 import json
+import os
 import pathlib
 import subprocess
 import tarfile
@@ -24,22 +25,73 @@ OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
 OCI_LAYER = "application/vnd.oci.image.layer.v1.tar+gzip"
 PREFIX = "oci-layer-acceptance"
 MUTANTS = ("missing-added", "wrong-replacement", "missing-delete", "missing-opaque")
+SYMLINK_CASES = {
+    "deleted": "deleted",
+    "delete-marker": ".wh.deleted",
+    "opaque-lower": "opaque/lower",
+    "opaque-nested": "opaque/nested",
+    "opaque-marker": "opaque/.wh..wh..opq",
+}
 
 GUEST_CHECK = r"""
 set -eu
 fail() { printf 'FAIL:%s\n' "$1" >&2; exit 1; }
+absent() { [ ! -e "$1" ] && [ ! -L "$1" ]; }
 p=/oci-layer-acceptance
 [ -f "$p/added" ] && [ "$(cat "$p/added")" = upper-added ] && [ "$(wc -c < "$p/added")" -eq 11 ] || fail added
 [ -f "$p/replaced" ] && [ "$(cat "$p/replaced")" = upper-replaced ] && [ "$(wc -c < "$p/replaced")" -eq 14 ] || fail replaced
-[ ! -e "$p/deleted" ] || fail deleted
-[ ! -e "$p/.wh.deleted" ] || fail delete-marker
+absent "$p/deleted" || fail deleted
+absent "$p/.wh.deleted" || fail delete-marker
 [ -f "$p/unchanged" ] && [ "$(cat "$p/unchanged")" = lower-unchanged ] && [ "$(wc -c < "$p/unchanged")" -eq 15 ] || fail unchanged
-[ ! -e "$p/opaque/lower" ] || fail opaque-lower
-[ ! -e "$p/opaque/nested" ] || fail opaque-nested
-[ ! -e "$p/opaque/.wh..wh..opq" ] || fail opaque-marker
+absent "$p/opaque/lower" || fail opaque-lower
+absent "$p/opaque/nested" || fail opaque-nested
+absent "$p/opaque/.wh..wh..opq" || fail opaque-marker
 [ -f "$p/opaque/upper" ] && [ "$(cat "$p/opaque/upper")" = upper-opaque ] && [ "$(wc -c < "$p/opaque/upper")" -eq 12 ] || fail opaque-upper
 printf 'OCI_LAYERS_OK\n'
 """.strip()
+
+
+def registry_opener():
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def registry_child_environment(environment):
+    child = {key: value for key, value in environment.items() if not key.lower().endswith("_proxy")}
+    child["NO_PROXY"] = "*"
+    child["no_proxy"] = "*"
+    return child
+
+
+def guest_script(symlink_case):
+    if symlink_case is None:
+        return GUEST_CHECK
+    path = SYMLINK_CASES[symlink_case]
+    target = "/oci-layer-acceptance-missing-" + uuid.uuid4().hex
+    link = f"/{PREFIX}/{path}"
+    return (
+        f"set -eu\n[ ! -e '{target}' ] && [ ! -L '{target}' ]\n"
+        f"ln -s '{target}' '{link}'\n"
+        f"[ -L '{link}' ] && [ ! -e '{link}' ]\n{GUEST_CHECK}"
+    )
+
+
+def validate_result(result, mutant, symlink_case):
+    expected_failures = {
+        "missing-added": b"FAIL:added\n",
+        "wrong-replacement": b"FAIL:replaced\n",
+        "missing-delete": b"FAIL:deleted\n",
+        "missing-opaque": b"FAIL:opaque-lower\n",
+    }
+    if symlink_case is not None:
+        expected = f"FAIL:{symlink_case}\n".encode()
+    elif mutant != "none":
+        expected = expected_failures[mutant]
+    else:
+        if result.returncode != 0 or result.stdout != b"OCI_LAYERS_OK\n" or result.stderr:
+            raise RuntimeError("real runner did not produce the exact successful guest result")
+        return
+    if result.returncode != 1 or result.stdout or result.stderr != expected:
+        raise RuntimeError("negative case did not produce its exact expected guest failure")
 
 
 def digest(data):
@@ -223,7 +275,10 @@ def main():
     parser.add_argument("--runner", type=pathlib.Path, required=True)
     parser.add_argument("--scratch", type=pathlib.Path, required=True)
     parser.add_argument("--mutant", choices=("none",) + MUTANTS, default="none")
+    parser.add_argument("--symlink-case", choices=tuple(SYMLINK_CASES))
     args = parser.parse_args()
+    if args.mutant != "none" and args.symlink_case is not None:
+        parser.error("--symlink-case cannot be combined with --mutant")
     for path in (args.bundle, args.runner, args.scratch):
         if not path.is_absolute() or not path.exists():
             parser.error(f"path must be absolute and exist: {path}")
@@ -241,6 +296,7 @@ def main():
         "manifest": digest(image),
         "config": json.loads(image)["config"]["digest"],
         "mutant": args.mutant,
+        "symlink_case": args.symlink_case,
         "fixture_layers": reports,
     }
     (root / "fixture.json").write_text(json.dumps(details, indent=2) + "\n", encoding="utf-8")
@@ -249,11 +305,15 @@ def main():
     server, thread = serve_fixture(image, blobs, tag)
     reference = f"127.0.0.1:{server.server_port}/fixture:{tag}"
     command = [str(args.runner), "--bundle", str(args.bundle), "--state-root", str(root / "state"),
-               "--image", reference, "--", "/bin/sh", "-c", GUEST_CHECK]
+               "--image", reference, "--", "/bin/sh", "-c", guest_script(args.symlink_case)]
     try:
+        with registry_opener().open(f"http://127.0.0.1:{server.server_port}/v2/", timeout=5) as response:
+            if response.read() != b"{}":
+                raise RuntimeError("local registry readiness check failed")
         (root / "command.json").write_text(json.dumps(command, indent=2) + "\n", encoding="utf-8")
         print(f"runner image={reference} state={root / 'state'}", flush=True)
-        result = subprocess.run(command, capture_output=True, check=False)
+        result = subprocess.run(command, capture_output=True, check=False,
+                                env=registry_child_environment(os.environ))
     finally:
         server.shutdown()
         server.server_close()
@@ -262,17 +322,7 @@ def main():
     (root / "stderr").write_bytes(result.stderr)
     print(f"runner exit={result.returncode} stdout={root / 'stdout'} stderr={root / 'stderr'}", flush=True)
     print(f"stdout={result.stdout!r}\nstderr={result.stderr!r}", flush=True)
-    expected_failures = {
-        "missing-added": b"FAIL:added\n",
-        "wrong-replacement": b"FAIL:replaced\n",
-        "missing-delete": b"FAIL:deleted\n",
-        "missing-opaque": b"FAIL:opaque-lower\n",
-    }
-    if args.mutant == "none":
-        if result.returncode != 0 or result.stdout != b"OCI_LAYERS_OK\n" or result.stderr:
-            raise RuntimeError("real runner did not produce the exact successful guest result")
-    elif result.returncode != 1 or result.stdout or result.stderr != expected_failures[args.mutant]:
-        raise RuntimeError("mutant did not produce its exact expected guest failure")
+    validate_result(result, args.mutant, args.symlink_case)
     print("PASS", flush=True)
 
 

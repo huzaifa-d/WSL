@@ -93,6 +93,10 @@ foreach ($mutant in @('missing-added', 'wrong-replacement', 'missing-delete', 'm
     python tools\aci-image-runner\tests\oci_layers.py --bundle $bundle --runner $runner --scratch $scratch --mutant $mutant
     if ($LASTEXITCODE -ne 0) { throw "OCI layer mutant did not fail as expected: $mutant" }
 }
+foreach ($case in @('deleted', 'delete-marker', 'opaque-lower', 'opaque-nested', 'opaque-marker')) {
+    python tools\aci-image-runner\tests\oci_layers.py --bundle $bundle --runner $runner --scratch $scratch --symlink-case $case
+    if ($LASTEXITCODE -ne 0) { throw "Dangling symlink was not detected: $case" }
+}
 ```
 
 The script inspects both generated tar archives before starting the runner. The
@@ -104,13 +108,19 @@ guest also checks that the markers themselves are absent and an unrelated lower
 file remains. Success requires exit code zero, stdout exactly `OCI_LAYERS_OK`
 followed by a newline, and empty stderr. Each mutant succeeds as a *test* only
 when the guest exits 1 with its exact expected failure on stderr and no stdout.
+Each symlink case creates one dangling link in the running guest after the image
+has been materialized, then requires the exact failure for that forbidden path.
+It does not change the image or whiteout tar semantics.
 
 Each run retains `fixture.json`, `manifest.json`, the inspected `lower.tar` and
 `upper.tar`, the exact runner argument vector in `command.json`, separate
 `stdout` and `stderr` files, and agent state in its own scratch directory.
 The fixture reports content and manifest SHA-256 digests. It needs network
 access only to fetch the public base; the agent pulls the test image from the
-local registry. The normal native-call hang and cleanup limitations below still
+local registry. The public fetch retains the host's normal proxy policy.
+Loopback checks use a proxy-free opener; the runner child receives no inherited
+`*_proxy` variables and gets `NO_PROXY=*`, without modifying the parent
+environment. The normal native-call hang and cleanup limitations below still
 apply; this test does not impose a whole-process timeout.
 
 The fixture's local construction and registry checks can also run without an
