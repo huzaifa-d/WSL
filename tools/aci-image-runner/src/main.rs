@@ -208,8 +208,13 @@ where
         .map_err(|error| RunnerError::Runtime(format!("setup: {}", redact(error_chain(&error)))))?;
     let (stdout, stderr) = prepare_output()
         .map_err(|error| RunnerError::Runtime(format!("output: {}", redact(error))))?;
-    let (backend, close) = open(config)
-        .map_err(|error| RunnerError::Runtime(format!("open agent: {}", redact(error))))?;
+    // AgentBackend::new may discard a host-close failure after opening the host.
+    let (backend, close) = open(config).map_err(|error| {
+        RunnerError::Runtime(format!(
+            "open agent: {}; agent host cleanup status may be unknown",
+            redact(error)
+        ))
+    })?;
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let lifecycle = lifecycle::execute(&client, args.command, stdout, stderr, &redact);
     drop(client);
@@ -304,9 +309,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aci_edge_sandboxes::testing::MockBackend;
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
+
+    type MockOpenResult =
+        Result<(Arc<MockBackend>, fn(Arc<MockBackend>) -> Result<(), String>), String>;
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -401,6 +410,128 @@ mod tests {
         assert_eq!(
             result,
             "raw=[redacted]; debug=\"[redacted]\"; ref=[redacted]"
+        );
+    }
+
+    #[test]
+    fn agent_initialization_failure_reports_uncertain_cleanup_and_redacts_values() {
+        let fixture = Fixture::new();
+        let secret = "secret\"argument";
+        let image = "private.example/image";
+        let mut args = fixture.args("--image", image.into());
+        args.push(secret.into());
+        let result = run_with(
+            args,
+            || Ok(()),
+            fixture.trust,
+            |_| -> MockOpenResult {
+                Err(format!(
+                    "startup failure: raw={secret}; debug={secret:?}; image={image}"
+                ))
+            },
+            || Ok((std::io::sink(), std::io::sink())),
+        );
+        assert_eq!(
+            result,
+            Err(RunnerError::Runtime(
+                "open agent: startup failure: raw=[redacted]; debug=\"[redacted]\"; image=[redacted]; agent host cleanup status may be unknown".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn actual_agent_constructor_failure_reports_uncertain_cleanup() {
+        let fixture = Fixture::new();
+        let error = run(
+            fixture.args("--image", "alpine".into()),
+            || Ok(()),
+            fixture.trust,
+        )
+        .unwrap_err();
+        let RunnerError::Runtime(message) = error else {
+            panic!("expected agent startup error, got {error:?}");
+        };
+        assert!(message.starts_with("open agent: "), "{message}");
+        assert!(
+            message.ends_with("; agent host cleanup status may be unknown"),
+            "{message}"
+        );
+        assert_ne!(
+            message,
+            "open agent: ; agent host cleanup status may be unknown"
+        );
+    }
+
+    #[test]
+    fn failures_before_agent_initialization_do_not_report_uncertain_cleanup() {
+        fn never_open(_: AgentConfig) -> MockOpenResult {
+            panic!("agent constructor must not run")
+        }
+
+        let fixture = Fixture::new();
+        let args = || fixture.args("--image", "alpine".into());
+        let arguments_error = run_with(
+            Vec::<OsString>::new(),
+            || panic!("host check must not run"),
+            fixture.trust,
+            never_open,
+            || Ok((std::io::sink(), std::io::sink())),
+        )
+        .unwrap_err();
+        assert_eq!(
+            arguments_error,
+            RunnerError::Arguments("missing -- separator before the guest program".into())
+        );
+
+        let host_error = run_with(
+            args(),
+            || Err("host check failed".into()),
+            fixture.trust,
+            never_open,
+            || Ok((std::io::sink(), std::io::sink())),
+        )
+        .unwrap_err();
+        assert_eq!(host_error, RunnerError::Host("host check failed".into()));
+
+        fs::remove_file(fixture.manifest()).unwrap();
+        let bundle_error = run_with(
+            args(),
+            || Ok(()),
+            fixture.trust,
+            never_open,
+            || Ok((std::io::sink(), std::io::sink())),
+        )
+        .unwrap_err();
+        assert!(matches!(bundle_error, RunnerError::Bundle(_)));
+        assert!(!bundle_error.to_string().contains("cleanup status"));
+        fs::write(fixture.manifest(), b"manifest fixture").unwrap();
+
+        let setup_error = run_with(
+            fixture.args("--image", "invalid reference".into()),
+            || Ok(()),
+            fixture.trust,
+            never_open,
+            || -> Result<(std::io::Sink, std::io::Sink), String> {
+                panic!("output setup must not run")
+            },
+        )
+        .unwrap_err();
+        assert!(setup_error.to_string().contains("setup:"), "{setup_error}");
+        assert!(!setup_error.to_string().contains("cleanup status"));
+
+        let output_error = run_with(
+            args(),
+            || Ok(()),
+            fixture.trust,
+            never_open,
+            || -> Result<(std::io::Sink, std::io::Sink), String> {
+                Err("output unavailable".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            output_error,
+            RunnerError::Runtime("output: output unavailable".into())
         );
     }
 
