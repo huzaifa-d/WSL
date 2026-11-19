@@ -49,8 +49,27 @@ type IsWow64Process2Fn = unsafe extern "system" fn(
 
 #[cfg(windows)]
 fn resolve_is_wow64_process2() -> Result<Option<IsWow64Process2Fn>, String> {
+    use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+
+    resolve_is_wow64_process2_with(|module, name| {
+        // The resolver supplies a pinned module and the named export's valid C string.
+        let address = unsafe { GetProcAddress(module, name) };
+        // The named export has the IsWow64Process2 Windows ABI declared above.
+        address.map(|function| unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, IsWow64Process2Fn>(function)
+        })
+    })
+}
+
+#[cfg(windows)]
+fn resolve_is_wow64_process2_with(
+    find: impl FnOnce(
+        windows_sys::Win32::Foundation::HMODULE,
+        windows_sys::core::PCSTR,
+    ) -> Option<IsWow64Process2Fn>,
+) -> Result<Option<IsWow64Process2Fn>, String> {
     use windows_sys::Win32::System::LibraryLoader::{
-        GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExA, GetProcAddress,
+        GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExA,
     };
 
     let mut module = std::ptr::null_mut();
@@ -69,11 +88,7 @@ fn resolve_is_wow64_process2() -> Result<Option<IsWow64Process2Fn>, String> {
         ));
     }
 
-    // The named export has the IsWow64Process2 Windows ABI declared above.
-    let address = unsafe { GetProcAddress(module, c"IsWow64Process2".as_ptr().cast()) };
-    Ok(address.map(|function| unsafe {
-        std::mem::transmute::<unsafe extern "system" fn() -> isize, IsWow64Process2Fn>(function)
-    }))
+    Ok(find(module, c"IsWow64Process2".as_ptr().cast()))
 }
 
 #[cfg(windows)]
@@ -273,16 +288,28 @@ mod tests {
 
         let fixture = Fixture::new();
         let args = || fixture.args("--image", "alpine".into());
-        assert_eq!(
-            run(
-                args(),
-                || check_windows_host("windows", "x86_64", || Ok(None)),
-                fixture.trust,
-            ),
-            Err(RunnerError::Host(
-                "unsupported host: IsWow64Process2 is unavailable; native Windows x64 cannot be verified".into()
-            ))
-        );
+        let error = run(
+            args(),
+            || {
+                check_windows_host("windows", "x86_64", || {
+                    resolve_is_wow64_process2_with(|module, name| {
+                        assert!(!module.is_null());
+                        // The resolver supplies a valid, NUL-terminated export name.
+                        assert_eq!(
+                            unsafe { std::ffi::CStr::from_ptr(name.cast()) },
+                            c"IsWow64Process2"
+                        );
+                        None
+                    })
+                })
+            },
+            fixture.trust,
+        )
+        .unwrap_err();
+        let message = "unsupported host: IsWow64Process2 is unavailable; native Windows x64 cannot be verified";
+        assert_eq!(error, RunnerError::Host(message.into()));
+        assert_eq!(error.to_string(), format!("aci-image-runner: {message}"));
+        assert_eq!(ERROR_EXIT_CODE, 1);
         assert_eq!(
             run(
                 args(),

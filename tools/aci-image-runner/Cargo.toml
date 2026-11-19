@@ -14,3 +14,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader", "Win
 [dev-dependencies]
 aci_edge_sandboxes = { version = "=0.1.2", features = ["testing"] }
 tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+object = { version = "=0.41.0", default-features = false, features = ["read_core", "pe", "std"] }
