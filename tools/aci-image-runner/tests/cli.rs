@@ -2,150 +2,53 @@
 
 use std::process::Command;
 
-#[cfg(windows)]
-fn supported_host() -> Result<bool, String> {
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::LibraryLoader::{
-        GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExA, GetProcAddress,
-    };
-    use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+fn runner() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_aci-image-runner"))
+}
 
-    type Query = unsafe extern "system" fn(HANDLE, *mut u16, *mut u16) -> i32;
-
-    let mut module = std::ptr::null_mut();
-    // Both pointers are valid; pinning keeps kernel32 loaded through the query.
-    let result = unsafe {
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_PIN,
-            c"kernel32.dll".as_ptr().cast(),
-            &mut module,
-        )
-    };
-    if result == 0 {
-        return Err(format!(
-            "cannot find kernel32.dll: {}",
-            std::io::Error::last_os_error()
-        ));
+#[test]
+fn rejects_legacy_arguments() {
+    for option in ["--image", "--image-file", "--bundle", "--state-root", "--"] {
+        let output = runner().args([option, "value"]).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{option}");
+        assert!(output.stdout.is_empty(), "{option}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("expected --config"));
     }
-    // This export has the Query ABI and signature.
-    let address = unsafe { GetProcAddress(module, c"IsWow64Process2".as_ptr().cast()) }.ok_or(
-        "unsupported host: IsWow64Process2 is unavailable; native Windows x64 cannot be verified",
-    )?;
-    let query =
-        unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Query>(address) };
-
-    let mut process_machine = 0;
-    let mut native_machine = 0;
-    // Both output pointers are valid, and GetCurrentProcess returns a process pseudo-handle.
-    let result = unsafe {
-        query(
-            GetCurrentProcess(),
-            &mut process_machine,
-            &mut native_machine,
-        )
-    };
-    if result == 0 {
-        return Err(format!(
-            "cannot determine native host architecture: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(std::env::consts::ARCH == "x86_64" && native_machine == IMAGE_FILE_MACHINE_AMD64)
-}
-
-#[cfg(not(windows))]
-fn supported_host() -> Result<bool, String> {
-    Ok(false)
 }
 
 #[test]
-fn cli_reports_argument_error_and_nonzero_exit() {
-    let output = Command::new(env!("CARGO_BIN_EXE_aci-image-runner"))
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "aci-image-runner: missing -- separator before the guest program\n"
-    );
-}
-
-#[test]
-fn cli_rejects_empty_guest_argument_before_host_or_bundle_checks() {
-    let path = std::env::current_dir().unwrap().join("not-a-bundle");
-    let output = Command::new(env!("CARGO_BIN_EXE_aci-image-runner"))
-        .arg("--bundle")
-        .arg(&path)
-        .arg("--state-root")
-        .arg(&path)
-        .args(["--image", "alpine", "--", "true", ""])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "aci-image-runner: empty guest arguments are not supported\n"
-    );
-}
-
-#[test]
-fn cli_uses_the_production_host_check_and_manifest_pin() {
-    let bundle = tempfile::tempdir().unwrap();
-    let manifest = bundle.path().join("SOURCE-MANIFEST.json");
-    std::fs::write(&manifest, b"not the approved manifest").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_aci-image-runner"))
-        .arg("--bundle")
-        .arg(bundle.path())
-        .arg("--state-root")
-        .arg(bundle.path().join("state"))
-        .args(["--image", "alpine", "--", "true"])
-        .output()
-        .unwrap();
-    let expected = match supported_host() {
-        Ok(true) => format!(
-            "aci-image-runner: SHA-256 mismatch for {}\n",
-            manifest.display()
-        ),
-        Ok(false) => format!(
-            "aci-image-runner: unsupported host or process architecture ({}/{}): native Windows x64 with WHP is required\n",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ),
-        Err(error) => format!("aci-image-runner: {error}\n"),
-    };
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert_eq!(String::from_utf8(output.stderr).unwrap(), expected);
-}
-
-#[test]
-fn cli_missing_bundle_preserves_os_error_with_one_character_argument() {
-    if !matches!(supported_host(), Ok(true)) {
-        eprintln!("skipped: production bundle check requires a native Windows x64 host");
-        return;
-    }
+fn rejects_other_backends_and_lifecycle_before_spawn() {
     let root = tempfile::tempdir().unwrap();
-    let bundle = root.path().join("missing-bundle");
-    let manifest = bundle.join("SOURCE-MANIFEST.json");
-    let cause = std::fs::File::open(&manifest).unwrap_err();
-    let output = Command::new(env!("CARGO_BIN_EXE_aci-image-runner"))
-        .arg("--bundle")
-        .arg(&bundle)
-        .arg("--state-root")
-        .arg(root.path().join("state"))
-        .args(["--image", "alpine", "--", "e"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        format!(
-            "aci-image-runner: cannot open {}: {cause}\n",
-            manifest.display()
-        )
-    );
+    for (name, json, message) in [
+        (
+            "process",
+            r#"{"version":"1.1.0-alpha","containment":"process","process":{"commandLine":"true"}}"#,
+            "only one-shot MicroVM containment is supported",
+        ),
+        (
+            "start",
+            r#"{"version":"1.1.0-alpha","phase":"start","sandboxId":"microvm:00000000000000000000000000000000"}"#,
+            "lifecycle phase requests are not supported",
+        ),
+    ] {
+        let path = root.path().join(format!("{name}.json"));
+        std::fs::write(&path, json).unwrap();
+        let output = runner().arg("--config").arg(path).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+    }
+}
+
+#[test]
+fn rejects_non_utf8_and_missing_config_files() {
+    let root = tempfile::tempdir().unwrap();
+    let invalid = root.path().join("invalid.json");
+    std::fs::write(&invalid, [0xff, 0x80]).unwrap();
+    for path in [invalid, root.path().join("missing.json")] {
+        let output = runner().arg("--config").arg(path).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read config file"));
+    }
 }

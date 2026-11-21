@@ -16,6 +16,16 @@ import oci_layers
 
 
 class FixtureTests(unittest.TestCase):
+    def test_request_uses_one_shot_microvm_and_guest_shell_script(self):
+        image = "127.0.0.1:12345/fixture:tag"
+        script = oci_layers.guest_script(None)
+        request = oci_layers.runner_request(image, script)
+        self.assertEqual(request["version"], "1.1.0-alpha")
+        self.assertEqual(request["containment"], "microvm")
+        self.assertEqual(request["microvm"], {"image": image})
+        self.assertEqual(request["process"]["commandLine"], script)
+        self.assertEqual(request["process"]["timeout"], 30000)
+
     def base(self):
         raw = oci_layers.make_tar({"bin/example": "base"})
         layer = gzip.compress(raw, mtime=0)
@@ -151,6 +161,20 @@ class FixtureTests(unittest.TestCase):
                 ):
                     with self.assertRaises(RuntimeError):
                         oci_layers.validate_result(bad, "none", case)
+
+    def test_native_snapshot_diagnostics_do_not_mask_guest_errors(self):
+        diagnostics = (
+            b"aci_edge_agent: template store X: captured generation 1\n"
+            b"aci-image-runner: NVX platform snapshots are unavailable, so sandboxes cold boot: reason\n"
+        )
+        oci_layers.validate_result(
+            subprocess.CompletedProcess([], 0, b"OCI_LAYERS_OK\n", diagnostics), "none", None
+        )
+        with self.assertRaises(RuntimeError):
+            oci_layers.validate_result(
+                subprocess.CompletedProcess([], 0, b"OCI_LAYERS_OK\n", diagnostics + b"guest error\n"),
+                "none", None
+            )
 
     def test_loopback_opener_bypasses_inherited_proxy(self):
         class Trap(http.server.BaseHTTPRequestHandler):

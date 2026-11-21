@@ -62,6 +62,15 @@ def registry_child_environment(environment):
     return child
 
 
+def runner_request(image, script):
+    return {
+        "version": "1.1.0-alpha",
+        "containment": "microvm",
+        "microvm": {"image": image},
+        "process": {"commandLine": script, "timeout": 30000},
+    }
+
+
 def guest_script(symlink_case):
     if symlink_case is None:
         return GUEST_CHECK
@@ -76,6 +85,13 @@ def guest_script(symlink_case):
 
 
 def validate_result(result, mutant, symlink_case):
+    stderr = b"".join(
+        line for line in result.stderr.splitlines(keepends=True)
+        if not (
+            (line.startswith(b"aci_edge_agent: template store ") and b": captured generation " in line)
+            or line.startswith(b"aci-image-runner: NVX platform snapshots are unavailable, so sandboxes cold boot:")
+        )
+    )
     expected_failures = {
         "missing-added": b"FAIL:added\n",
         "wrong-replacement": b"FAIL:replaced\n",
@@ -87,10 +103,10 @@ def validate_result(result, mutant, symlink_case):
     elif mutant != "none":
         expected = expected_failures[mutant]
     else:
-        if result.returncode != 0 or result.stdout != b"OCI_LAYERS_OK\n" or result.stderr:
+        if result.returncode != 0 or result.stdout != b"OCI_LAYERS_OK\n" or stderr:
             raise RuntimeError("real runner did not produce the exact successful guest result")
         return
-    if result.returncode != 1 or result.stdout or result.stderr != expected:
+    if result.returncode != 1 or result.stdout or stderr != expected:
         raise RuntimeError("negative case did not produce its exact expected guest failure")
 
 
@@ -271,7 +287,6 @@ def serve_fixture(manifest, blobs, tag):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bundle", type=pathlib.Path, required=True)
     parser.add_argument("--runner", type=pathlib.Path, required=True)
     parser.add_argument("--scratch", type=pathlib.Path, required=True)
     parser.add_argument("--mutant", choices=("none",) + MUTANTS, default="none")
@@ -279,7 +294,7 @@ def main():
     args = parser.parse_args()
     if args.mutant != "none" and args.symlink_case is not None:
         parser.error("--symlink-case cannot be combined with --mutant")
-    for path in (args.bundle, args.runner, args.scratch):
+    for path in (args.runner, args.scratch):
         if not path.is_absolute() or not path.exists():
             parser.error(f"path must be absolute and exist: {path}")
     root = pathlib.Path(tempfile.mkdtemp(prefix="oci-layers-", dir=args.scratch))
@@ -300,26 +315,31 @@ def main():
         "fixture_layers": reports,
     }
     (root / "fixture.json").write_text(json.dumps(details, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(details, indent=2), flush=True)
     tag = uuid.uuid4().hex
     server, thread = serve_fixture(image, blobs, tag)
     reference = f"127.0.0.1:{server.server_port}/fixture:{tag}"
-    command = [str(args.runner), "--bundle", str(args.bundle), "--state-root", str(root / "state"),
-               "--image", reference, "--", "/bin/sh", "-c", guest_script(args.symlink_case)]
+    config = root / "request.json"
+    config.write_text(json.dumps(runner_request(reference, guest_script(args.symlink_case))), encoding="utf-8")
+    command = [str(args.runner), "--config", str(config)]
+    environment = registry_child_environment(os.environ)
+    environment["LOCALAPPDATA"] = str(root)
+    environment.pop("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR", None)
     try:
         with registry_opener().open(f"http://127.0.0.1:{server.server_port}/v2/", timeout=5) as response:
             if response.read() != b"{}":
                 raise RuntimeError("local registry readiness check failed")
         (root / "command.json").write_text(json.dumps(command, indent=2) + "\n", encoding="utf-8")
-        print(f"runner image={reference} state={root / 'state'}", flush=True)
+        print(f"runner image={reference} LOCALAPPDATA={root}", flush=True)
         result = subprocess.run(command, capture_output=True, check=False,
-                                env=registry_child_environment(os.environ))
+                                env=environment)
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
     (root / "stdout").write_bytes(result.stdout)
     (root / "stderr").write_bytes(result.stderr)
+    if not (root / "Microsoft" / "MXC" / "nvx").is_dir():
+        raise RuntimeError("SDK state was not created under the owned LOCALAPPDATA directory")
     print(f"runner exit={result.returncode} stdout={root / 'stdout'} stderr={root / 'stderr'}", flush=True)
     print(f"stdout={result.stdout!r}\nstderr={result.stderr!r}", flush=True)
     validate_result(result, args.mutant, args.symlink_case)

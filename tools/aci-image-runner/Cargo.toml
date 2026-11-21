@@ -5,15 +5,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
-aci_edge_sandboxes = "=0.1.2"
-sha2 = "0.10"
+mxc-sdk = { git = "https://github.com/microsoft/mxc.git", rev = "40eebd39ab5e5a02d350169a8c96c28b33ddba7e", default-features = false, features = ["microvm"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_Threading"] }
 
 [dev-dependencies]
-aci_edge_sandboxes = { version = "=0.1.2", features = ["testing"] }
 tempfile = "3"
-
-[target.'cfg(windows)'.dev-dependencies]
-object = { version = "=0.41.0", default-features = false, features = ["read_core", "pe", "std"] }
