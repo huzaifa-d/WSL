@@ -68,6 +68,8 @@ physical directory for isolated test state.
 ```powershell
 python -m unittest discover -s tools\aci-image-runner\tests -p test_oci_layers.py
 if ($LASTEXITCODE -ne 0) { throw 'OCI fixture unit tests failed' }
+python -m unittest discover -s tools\aci-image-runner\tests -p test_nvx_policy.py
+if ($LASTEXITCODE -ne 0) { throw 'NVX probe regression tests failed' }
 python tools\aci-image-runner\tests\nvx_policy.py --runner $runner --scratch $scratch
 if ($LASTEXITCODE -ne 0) { throw 'NVX policy tests failed' }
 python tools\aci-image-runner\tests\oci_layers.py --runner $runner --scratch $scratch
@@ -86,9 +88,11 @@ For the opt-in live tests, `$scratch` must be an existing, absolute,
 user-owned physical directory with no reparse-point ancestors. Each fixture
 sets `LOCALAPPDATA` only for its child processes and retains test state and
 results beneath its scratch directory. The policy tests adapt the one-shot
-filesystem and network cases and seven one-shot fixtures from the pinned MXC
-`nvx_e2e.rs`, `nvx_e2e/network.rs` and `fixtures/microvm` tests. They use
-owned files and controlled host ports;
+filesystem and network cases and seven unmodified one-shot JSON fixtures from
+the MIT-licensed MXC `nvx_e2e.rs`, `nvx_e2e/network.rs` and `fixtures/microvm`
+at the pinned revision. UDP checks count and correlate host receipts as well as
+guest replies; a host-only regression verifies that a dropped reply cannot
+hide a delivered datagram. The tests use owned files and controlled host ports;
 they require a reachable host IPv4 route and do not modify firewall rules.
 The OCI fixture fetches a digest-pinned public base image, checks generated
 layers, and serves the test image from an unauthenticated registry bound only

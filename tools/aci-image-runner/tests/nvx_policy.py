@@ -8,10 +8,12 @@
 """Opt-in Windows x64/WHP one-shot policy tests. See the runner README."""
 
 import argparse
+import errno
 import ipaddress
 import json
 import os
 import pathlib
+import re
 import shlex
 import socket
 import subprocess
@@ -19,6 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 
 
 IMAGE = "docker.io/library/python:3.12-alpine"
@@ -51,42 +54,84 @@ def python_command(script):
 
 
 class ControlledServices:
-    def __init__(self):
-        route = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            route.connect(("192.0.2.1", 9))
-            self.host = route.getsockname()[0]
-        finally:
-            route.close()
-        if self.host.startswith(("127.", "10.0.0.")):
+    def __init__(self, host=None, drop_udp_replies=False):
+        explicit_host = host is not None
+        if host is None:
+            route = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                route.connect(("192.0.2.1", 9))
+                host = route.getsockname()[0]
+            finally:
+                route.close()
+        self.host = host
+        if self.host.startswith("10.0.0.") or (not explicit_host and self.host.startswith("127.")):
             raise RuntimeError("controlled endpoints require a non-loopback host outside 10.0.0.0/24")
+        self.drop_udp_replies = drop_udp_replies
         self.stop = threading.Event()
+        self.lock = threading.Lock()
+        self.errors = []
+        self.datagrams = {}
         self.sockets = []
         self.threads = []
         self.ports = []
+        try:
+            self.start()
+        except Exception:
+            self.close()
+            raise
+
+    def start(self):
         for _ in range(2):
-            for attempt in range(32):
+            for attempt in range(64):
                 udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                udp.bind((self.host, 0))
-                tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 try:
-                    tcp.bind(udp.getsockname())
-                    break
+                    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 except OSError:
+                    udp.close()
+                    raise
+                try:
+                    first, second = (udp, tcp) if attempt % 2 == 0 else (tcp, udp)
+                    first.bind((self.host, 0))
+                    second.bind(first.getsockname())
+                    break
+                except OSError as error:
                     tcp.close()
                     udp.close()
-                    if attempt == 31:
+                    if (error.errno not in (errno.EACCES, errno.EADDRINUSE, 10013, 10048)
+                            and getattr(error, "winerror", None) not in (10013, 10048)) or attempt == 63:
                         raise
+            self.sockets.extend((tcp, udp))
             tcp.listen()
             tcp.settimeout(0.1)
             udp.settimeout(0.1)
-            self.ports.append(tcp.getsockname()[1])
-            self.sockets.extend((tcp, udp))
+            port = tcp.getsockname()[1]
+            self.ports.append(port)
+            self.datagrams[port] = {}
             for target, sock in ((self.serve_tcp, tcp), (self.serve_udp, udp)):
-                thread = threading.Thread(target=target, args=(sock,))
+                thread = threading.Thread(target=self.worker, args=(target, sock))
                 thread.start()
                 self.threads.append(thread)
         self.ports.sort()
+
+    def worker(self, target, listener):
+        try:
+            target(listener)
+        except Exception as error:
+            with self.lock:
+                self.errors.append(error)
+
+    def check_errors(self):
+        with self.lock:
+            error = self.errors[0] if self.errors else None
+        if error is not None:
+            raise RuntimeError("controlled host service failed") from error
+
+    def receipt_counts(self, nonce=None):
+        self.check_errors()
+        with self.lock:
+            if nonce is None:
+                return [sum(self.datagrams[port].values()) for port in self.ports]
+            return [self.datagrams[port].get(f"{nonce}:{port}".encode(), 0) for port in self.ports]
 
     def serve_tcp(self, listener):
         while not self.stop.is_set():
@@ -95,6 +140,7 @@ class ControlledServices:
             except socket.timeout:
                 continue
             with connection:
+                connection.settimeout(5)
                 connection.sendall(b"NVX_DIRECT_OK")
 
     def serve_udp(self, listener):
@@ -103,7 +149,12 @@ class ControlledServices:
                 data, peer = listener.recvfrom(1024)
             except socket.timeout:
                 continue
-            listener.sendto(b"NVX_DIRECT_OK" + data, peer)
+            port = listener.getsockname()[1]
+            with self.lock:
+                counts = self.datagrams[port]
+                counts[data] = counts.get(data, 0) + 1
+            if not self.drop_udp_replies:
+                listener.sendto(b"NVX_DIRECT_OK" + data, peer)
 
     def close(self):
         self.stop.set()
@@ -111,26 +162,53 @@ class ControlledServices:
             thread.join()
         for sock in self.sockets:
             sock.close()
+        self.check_errors()
+
+
+def assert_network_probe(result, tcp, udp, deltas, correlated):
+    if result != {"tcp": tcp, "udp": udp}:
+        raise AssertionError("guest network probe outcomes differ from expected")
+    expected = [int(value == "reached") for value in udp]
+    if deltas != expected:
+        raise AssertionError(f"UDP endpoint delivery count: expected {expected}, got {deltas}")
+    if correlated != expected:
+        raise AssertionError(f"UDP correlated delivery count: expected {expected}, got {correlated}")
 
 
 NETWORK_PROBE = """
-import json, os, socket
+import errno, json, os, socket
 host = os.environ["NVX_HOST"]
 ports = json.loads(os.environ["NVX_PORTS"])
+nonce = os.environ["NVX_NONCE"]
+def blocked(error):
+    return isinstance(error, TimeoutError) or error.errno in (
+        errno.EACCES, errno.EPERM, errno.ENETUNREACH, errno.EHOSTUNREACH,
+        errno.ECONNREFUSED, errno.ETIMEDOUT
+    )
 def tcp(port):
     try:
-        with socket.create_connection((host, port), timeout=2) as connection:
-            return "reached" if connection.recv(13) == b"NVX_DIRECT_OK" else "bad"
-    except OSError:
-        return "blocked"
+        connection = socket.create_connection((host, port), timeout=2)
+    except OSError as error:
+        if blocked(error):
+            return "blocked"
+        raise
+    with connection, connection.makefile("rb") as reader:
+        assert reader.read(len(b"NVX_DIRECT_OK")) == b"NVX_DIRECT_OK"
+    return "reached"
 def udp(port):
+    payload = (nonce + ":" + str(port)).encode()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
             connection.settimeout(2)
-            connection.sendto(b"probe", (host, port))
-            return "reached" if connection.recv(1024) == b"NVX_DIRECT_OKprobe" else "bad"
-    except OSError:
-        return "blocked"
+            connection.sendto(payload, (host, port))
+            reply, peer = connection.recvfrom(1024)
+    except OSError as error:
+        if blocked(error):
+            return "blocked"
+        raise
+    assert peer == (host, port), peer
+    assert reply == b"NVX_DIRECT_OK" + payload, reply
+    return "reached"
 print(json.dumps({"tcp": [tcp(p) for p in ports], "udp": [udp(p) for p in ports]}))
 """
 
@@ -198,7 +276,10 @@ class NvxPolicyTests(unittest.TestCase):
         return [str(RUNNER), "--config", str(path)]
 
     def run_request(self, config):
-        result = subprocess.run(self.command(config), env=self.env, capture_output=True, check=False)
+        return self.run_config_file(pathlib.Path(self.command(config)[2]))
+
+    def run_config_file(self, path):
+        result = subprocess.run([str(RUNNER), "--config", str(path)], env=self.env, capture_output=True, check=False)
         self.assertTrue((self.local / "Microsoft" / "MXC" / "nvx").is_dir())
         return result
 
@@ -206,6 +287,24 @@ class NvxPolicyTests(unittest.TestCase):
         result = self.run_request(config)
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
         return result.stdout
+
+    def probe_network(self, services, policy, tcp, udp):
+        nonce = uuid.uuid4().hex
+        before = services.receipt_counts()
+        config = request(python_command(NETWORK_PROBE), network={"egress": policy})
+        config["process"].update({
+            "env": [
+                "NVX_HOST=" + services.host,
+                "NVX_PORTS=" + json.dumps(services.ports),
+                "NVX_NONCE=" + nonce,
+            ],
+            "inheritDefaultEnv": True,
+        })
+        result = json.loads(self.success(config))
+        time.sleep(0.1)
+        after = services.receipt_counts()
+        assert_network_probe(result, tcp, udp, [end - start for start, end in zip(before, after)],
+                             services.receipt_counts(nonce))
 
     def test_process_streams_exit_cwd_env_timeout_and_memory(self):
         result = self.run_request(request("printf '\\000\\377A'; printf '\\200B' >&2; exit 7"))
@@ -224,25 +323,19 @@ class NvxPolicyTests(unittest.TestCase):
         self.assertIn(b"workload timed out", result.stderr)
 
     def test_upstream_one_shot_fixtures(self):
-        image = "mcr.microsoft.com/azurelinux/base/core:3.0"
+        fixture_dir = pathlib.Path(__file__).parent / "fixtures" / "microvm"
         fixtures = [
-            ("hello", "printf 'Hello from MicroVM! sum=100\\n'", 0, b"Hello from MicroVM! sum=100\n"),
-            ("exit_code", "exit 42", 42, b""),
-            ("multiline", 'a=0; b=1; i=0; while [ "$i" -lt 10 ]; do printf \'fib(%d) = %d\\n\' "$i" "$a"; next=$((a + b)); a=$b; b=$next; i=$((i + 1)); done',
-             0, b"".join(f"fib({i}) = {value}\n".encode() for i, value in enumerate([0, 1, 1, 2, 3, 5, 8, 13, 21, 34]))),
-            ("stdlib", "printf 'shell=posix\\n'; uname -s", 0, b"shell=posix\nLinux\n"),
-            ("error", "printf 'intentional test error\\n' >&2; exit 1", 1, b""),
-            ("timeout", "sleep 120; printf 'should not reach here\\n'", 1, b""),
-            ("large_output", 'i=0; while [ "$i" -lt 1000 ]; do printf \'line %d: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n\' "$i"; i=$((i + 1)); done',
-             0, b"".join(f"line {i}: ".encode() + b"x" * 80 + b"\n" for i in range(1000))),
+            ("hello", 0, b"Hello from MicroVM! sum=100\n"),
+            ("exit_code", 42, b""),
+            ("multiline", 0, b"".join(f"fib({i}) = {value}\n".encode() for i, value in enumerate([0, 1, 1, 2, 3, 5, 8, 13, 21, 34]))),
+            ("stdlib", 0, b"shell=posix\nLinux\n"),
+            ("error", 1, b""),
+            ("timeout", 1, b""),
+            ("large_output", 0, b"".join(f"line {i}: ".encode() + b"x" * 80 + b"\n" for i in range(1000))),
         ]
-        for name, command, status, expected in fixtures:
+        for name, status, expected in fixtures:
             with self.subTest(fixture=name):
-                config = request(command)
-                config["microvm"]["image"] = image
-                if name == "timeout":
-                    config["process"]["timeout"] = 5000
-                result = self.run_request(config)
+                result = self.run_config_file(fixture_dir / f"microvm_{name}.json")
                 self.assertEqual(result.returncode, status, name)
                 self.assertEqual(result.stdout, expected, name)
                 if name == "error":
@@ -301,7 +394,12 @@ class NvxPolicyTests(unittest.TestCase):
             self.assertIn(message, result.stderr.lower())
 
     def test_filesystem_readonly_readwrite_and_deny(self):
-        root = pathlib.Path(tempfile.mkdtemp(prefix="f", dir=SCRATCH))
+        parent = pathlib.Path(tempfile.mkdtemp(prefix="f", dir=SCRATCH))
+        actual = parent / "PolicyAlias"
+        actual.mkdir()
+        root = parent / "pOLICYalias"
+        self.assertTrue(os.path.samefile(actual, root))
+        self.assertEqual(guest_path(actual), guest_path(root))
         ro, rw = root / "ro", root / "rw"
         ro.mkdir()
         rw.mkdir()
@@ -332,7 +430,7 @@ for path, write, expected in [
 (root / "rw" / "result").write_bytes(b"write-ok")
 print("NVX_FILESYSTEM_OK", end="")
 """
-        config = request(python_command(script), filesystem={
+        config = request(python_command(script), network={}, filesystem={
             "readonlyPaths": [str(ro)], "readwritePaths": [str(rw)],
             "deniedPaths": [str(rw / "secret")],
         })
@@ -342,6 +440,45 @@ print("NVX_FILESYSTEM_OK", end="")
         self.assertEqual((rw / "secret").read_bytes(), b"secret")
         self.assertEqual((rw / "result").read_bytes(), b"write-ok")
         self.assertEqual((root / "ungranted").read_bytes(), b"ungranted")
+
+    def test_credentialed_proxy_rejection_withholds_details_and_run_state(self):
+        username = "mxc-test-user-" + uuid.uuid4().hex
+        password = "mxc-test-password-" + uuid.uuid4().hex
+        cases = [
+            ("credentialed-loopback", f"http://{username}:{password}@[::1]:3128",
+             (b"validate_provision", b"withheld")),
+            ("user-only-loopback", f"http://{username}@[::1]:3128",
+             (b"validate_provision", b"withheld")),
+            ("loopback", "http://[::1]:3128", (b"OpenVMM reaches host loopback",)),
+            ("credentialed-remote", f"http://{username}:{password}@192.0.2.1:3128", (b"localhost",)),
+        ]
+        for name, proxy, expected in cases:
+            with self.subTest(case=name):
+                local = pathlib.Path(tempfile.mkdtemp(prefix="c", dir=SCRATCH))
+                environment = self.env.copy()
+                environment["LOCALAPPDATA"] = str(local)
+                config = request("printf forbidden", network={"egress": {"default": "deny"}},
+                                 runtimeConfig={"networkProxy": proxy})
+                command = self.command(config)
+                try:
+                    result = subprocess.run(command, env=environment, capture_output=True, check=False)
+                finally:
+                    pathlib.Path(command[2]).unlink()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(b"forbidden" in result.stdout, "rejected request ran its guest command")
+                self.assertFalse(any(value.encode() in result.stdout + result.stderr for value in (username, password)),
+                                 "proxy diagnostics leaked synthetic credentials")
+                for text in expected:
+                    self.assertTrue(text in result.stderr, f"{name}: expected proxy diagnostic absent")
+                state = local / "Microsoft" / "MXC" / "nvx"
+                if state.is_dir():
+                    roots = [state, *(child for child in state.iterdir() if child.is_dir())]
+                    self.assertFalse(any((root / "templates").exists() for root in roots),
+                                     "rejected request created a template store")
+                    self.assertFalse(any(
+                        re.fullmatch(r"[0-9a-f]{32}", entry.name)
+                        for root in roots for entry in root.iterdir() if entry.is_dir()
+                    ), "rejected request retained a sandbox record")
 
     def test_egress_cidr_protocol_ports_and_deny(self):
         services = ControlledServices()
@@ -380,12 +517,7 @@ print("NVX_FILESYSTEM_OK", end="")
             ]
             for index, (policy, tcp, udp) in enumerate(cases):
                 with self.subTest(case=index):
-                    config = request(python_command(NETWORK_PROBE), network={"egress": policy})
-                    config["process"].update({
-                        "env": ["NVX_HOST=" + host, "NVX_PORTS=" + json.dumps(ports)],
-                        "inheritDefaultEnv": True,
-                    })
-                    self.assertEqual(json.loads(self.success(config)), {"tcp": tcp, "udp": udp})
+                    self.probe_network(services, policy, tcp, udp)
         finally:
             services.close()
 
@@ -415,21 +547,22 @@ print("NVX_FILESYSTEM_OK", end="")
         worker = threading.Thread(target=serve)
         worker.start()
         try:
-            control = request(python_command(NETWORK_PROBE), network={"egress": {"default": "allow"}})
-            control["process"].update({
-                "env": ["NVX_HOST=" + services.host, "NVX_PORTS=" + json.dumps(services.ports)],
-                "inheritDefaultEnv": True,
-            })
-            self.assertEqual(json.loads(self.success(control)), {
-                "tcp": ["reached", "reached"], "udp": ["reached", "reached"]
-            })
+            self.probe_network(services, {"default": "allow"}, ["reached", "reached"], ["reached", "reached"])
             script = """
-import json, os, socket, urllib.request
+import errno, json, os, socket, urllib.request
 try:
-    with socket.create_connection((os.environ["NVX_HOST"], int(os.environ["NVX_PORT"])), timeout=2):
-        direct = "reached"
-except OSError:
+    connection = socket.create_connection((os.environ["NVX_HOST"], int(os.environ["NVX_PORT"])), timeout=2)
+except OSError as error:
+    if not (isinstance(error, TimeoutError) or error.errno in (
+        errno.EACCES, errno.EPERM, errno.ENETUNREACH, errno.EHOSTUNREACH,
+        errno.ECONNREFUSED, errno.ETIMEDOUT
+    )):
+        raise
     direct = "blocked"
+else:
+    with connection, connection.makefile("rb") as reader:
+        assert reader.read(len(b"NVX_DIRECT_OK")) == b"NVX_DIRECT_OK"
+    direct = "reached"
 proxy = urllib.request.urlopen("http://mxc-policy.invalid/probe", timeout=10).read().decode()
 print(json.dumps({"direct": direct, "proxy": proxy}))
 """
@@ -440,6 +573,7 @@ print(json.dumps({"direct": direct, "proxy": proxy}))
                 "inheritDefaultEnv": True,
             })
             self.assertEqual(json.loads(self.success(config)), {"direct": "blocked", "proxy": "NVX_PROXY_OK"})
+            self.probe_network(services, {"default": "allow"}, ["reached", "reached"], ["reached", "reached"])
         finally:
             worker.join()
             listener.close()
@@ -486,7 +620,7 @@ print(json.dumps({"direct": direct, "proxy": proxy}))
                                     if client.recv(16) == b"reply":
                                         observed[index] = True
                                         break
-                            except OSError:
+                            except (ConnectionRefusedError, ConnectionResetError, TimeoutError, BlockingIOError):
                                 time.sleep(0.05)
                 finally:
                     (root / "stop").write_text("stop")
