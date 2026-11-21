@@ -50,6 +50,10 @@ MicroVM backend. Other containment backends and lifecycle `phase` requests
 are rejected. This runner does not offer MXC lifecycle or captured-output
 APIs, prepared disk images, or the old direct-argument CLI.
 
+One-shot `lifecycle` policy defaults to `destroyOnExit: true` and
+`preservePolicy: false`; MXC rejects the opposite values. These policy fields
+are distinct from the unsupported lifecycle `phase` operations.
+
 `process.commandLine` is interpreted by the guest POSIX shell. Stdout and
 stderr are streamed separately as bytes, and the guest exit code is returned.
 MXC or native runtime diagnostics and warnings can also appear on stderr.
@@ -94,6 +98,8 @@ at the pinned revision. UDP checks count and correlate host receipts as well as
 guest replies; a host-only regression verifies that a dropped reply cannot
 hide a delivered datagram. The tests use owned files and controlled host ports;
 they require a reachable host IPv4 route and do not modify firewall rules.
+The live tests also exercise one-shot lifecycle defaults and rejections, the
+accepted legacy fallback settings and a subsequent run after a timeout.
 The OCI fixture fetches a digest-pinned public base image, checks generated
 layers, and serves the test image from an unauthenticated registry bound only
 to loopback. Its child proxy environment is isolated from the parent.

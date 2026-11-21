@@ -5,14 +5,45 @@ import errno
 import io
 import json
 import os
+import pathlib
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
 
 import nvx_policy
+
+
+class LifecyclePolicyRegressionTests(unittest.TestCase):
+    def test_silently_ignored_flags_cannot_pass_rejection_oracle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            marker = root / "guest-marker"
+            state = root / "Microsoft" / "MXC" / "nvx"
+            for flag in ("destroyOnExit", "preservePolicy"):
+                with self.subTest(flag=flag):
+                    expected = f"NVX requires lifecycle.{flag}={'true' if flag == 'destroyOnExit' else 'false'}"
+                    rejected = subprocess.CompletedProcess(
+                        [], 1, b"", f"aci-image-runner: policy_validation: {expected}\n".encode()
+                    )
+                    nvx_policy.assert_lifecycle_rejected(rejected, expected, marker, state)
+                    silently_ignored = subprocess.CompletedProcess([], 0, b"LIFECYCLE_OK", b"")
+                    with self.assertRaisesRegex(AssertionError, "lifecycle request"):
+                        nvx_policy.assert_lifecycle_rejected(silently_ignored, expected, marker, state)
+                    wrong_diagnostic = subprocess.CompletedProcess([], 1, b"", b"wrong policy\n")
+                    with self.assertRaisesRegex(AssertionError, "lifecycle request"):
+                        nvx_policy.assert_lifecycle_rejected(wrong_diagnostic, expected, marker, state)
+                    marker.write_bytes(b"STARTED")
+                    with self.assertRaisesRegex(AssertionError, "guest marker"):
+                        nvx_policy.assert_lifecycle_rejected(rejected, expected, marker, state)
+                    marker.unlink()
+                    state.mkdir(parents=True)
+                    with self.assertRaisesRegex(AssertionError, "created NVX state"):
+                        nvx_policy.assert_lifecycle_rejected(rejected, expected, marker, state)
+                    state.rmdir()
 
 
 class ProbeRegressionTests(unittest.TestCase):

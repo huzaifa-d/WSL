@@ -175,6 +175,16 @@ def assert_network_probe(result, tcp, udp, deltas, correlated):
         raise AssertionError(f"UDP correlated delivery count: expected {expected}, got {correlated}")
 
 
+def assert_lifecycle_rejected(result, expected, marker, state):
+    diagnostic = f"aci-image-runner: policy_validation: {expected}\n".encode()
+    if result.returncode != 1 or result.stdout or result.stderr != diagnostic:
+        raise AssertionError(f"lifecycle request did not return the expected rejection: {expected}")
+    if marker.exists():
+        raise AssertionError("rejected lifecycle request wrote the guest marker")
+    if state.exists():
+        raise AssertionError("rejected lifecycle request created NVX state")
+
+
 NETWORK_PROBE = """
 import errno, json, os, socket
 host = os.environ["NVX_HOST"]
@@ -305,6 +315,106 @@ class NvxPolicyTests(unittest.TestCase):
         after = services.receipt_counts()
         assert_network_probe(result, tcp, udp, [end - start for start, end in zip(before, after)],
                              services.receipt_counts(nonce))
+
+    def lifecycle_marker_request(self, root, name):
+        config = request(f'printf STARTED > "$NVX_LIFECYCLE_ROOT/{name}"; printf LIFECYCLE_OK',
+                         filesystem={"readwritePaths": [str(root)]})
+        config["process"].update({
+            "env": ["NVX_LIFECYCLE_ROOT=" + guest_path(root)],
+            "inheritDefaultEnv": True,
+        })
+        return config
+
+    def test_one_shot_lifecycle_defaults_and_explicit_valid(self):
+        root = pathlib.Path(tempfile.mkdtemp(prefix="l", dir=SCRATCH))
+        cases = [
+            ("absent", None),
+            ("empty", {}),
+            ("destroy-default", {"destroyOnExit": True}),
+            ("preserve-default", {"preservePolicy": False}),
+            ("explicit", {"destroyOnExit": True, "preservePolicy": False}),
+        ]
+        for name, policy in cases:
+            with self.subTest(case=name):
+                marker = root / name
+                self.assertFalse(marker.exists())
+                config = self.lifecycle_marker_request(root, name)
+                if policy is not None:
+                    config["lifecycle"] = policy
+                result = self.run_request(config)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"LIFECYCLE_OK")
+                self.assertEqual(marker.read_bytes(), b"STARTED")
+
+    def test_one_shot_lifecycle_invalid_and_precedence(self):
+        root = pathlib.Path(tempfile.mkdtemp(prefix="l", dir=SCRATCH))
+        destroy_error = "NVX requires lifecycle.destroyOnExit=true"
+        preserve_error = "NVX requires lifecycle.preservePolicy=false"
+        cases = [
+            ("destroy", {"destroyOnExit": False}, destroy_error),
+            ("preserve", {"preservePolicy": True}, preserve_error),
+            ("combined", {"destroyOnExit": False, "preservePolicy": True}, destroy_error),
+        ]
+        controls = []
+        for name, policy, expected in cases:
+            with self.subTest(case=name):
+                local = pathlib.Path(tempfile.mkdtemp(prefix="s", dir=SCRATCH))
+                environment = self.env.copy()
+                environment["LOCALAPPDATA"] = str(local)
+                state = local / "Microsoft" / "MXC" / "nvx"
+                marker = root / name
+                self.assertFalse(marker.exists())
+                config = self.lifecycle_marker_request(root, name)
+                config["lifecycle"] = policy.copy()
+                result = subprocess.run(self.command(config), env=environment, capture_output=True, check=False)
+                assert_lifecycle_rejected(result, expected, marker, state)
+                if name == "combined":
+                    config["lifecycle"].pop("destroyOnExit")
+                    result = subprocess.run(self.command(config), env=environment, capture_output=True, check=False)
+                    assert_lifecycle_rejected(result, preserve_error, marker, state)
+                config["lifecycle"] = {}
+                controls.append((name, config, environment, state))
+        for name, config, environment, state in controls:
+            with self.subTest(control=name):
+                marker = root / name
+                self.assertFalse(marker.exists())
+                result = subprocess.run(self.command(config), env=environment, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"LIFECYCLE_OK")
+                self.assertEqual(marker.read_bytes(), b"STARTED")
+                self.assertTrue(state.is_dir())
+
+    def test_one_shot_fallback_variants_and_host_cpu_profile(self):
+        self.assertIn(b"Processor (host profile)", self.success(request("cat /proc/cpuinfo")))
+        marker = "mxc-" + uuid.uuid4().hex
+        command = (f"test ! -e /tmp/{marker} || exit 99; touch /tmp/{marker}; "
+                   f"printf '{marker}'; printf 'fallback-stderr\\n' >&2; exit 42")
+        for name, fallback in [
+            ("absent", None),
+            ("empty", {}),
+            ("enabled", {"allowDaclMutation": True}),
+            ("disabled", {"allowDaclMutation": False}),
+        ]:
+            with self.subTest(case=name):
+                config = request(command)
+                if fallback is not None:
+                    config["fallback"] = fallback
+                result = self.run_request(config)
+                self.assertEqual(result.returncode, 42)
+                self.assertEqual(result.stdout, marker.encode())
+                self.assertIn(b"fallback-stderr\n", result.stderr)
+
+    def test_one_shot_recovers_after_timeout(self):
+        config = request("printf partial-out; printf 'partial-err\\n' >&2; sleep 5")
+        config["process"]["timeout"] = 200
+        timeout = self.run_request(config)
+        self.assertEqual(timeout.returncode, 1)
+        self.assertEqual(timeout.stdout, b"partial-out")
+        self.assertIn(b"partial-err\n", timeout.stderr)
+        self.assertIn(b"workload timed out", timeout.stderr)
+        recovered = self.run_request(request("printf after-timeout"))
+        self.assertEqual(recovered.returncode, 0)
+        self.assertEqual(recovered.stdout, b"after-timeout")
 
     def test_process_streams_exit_cwd_env_timeout_and_memory(self):
         result = self.run_request(request("printf '\\000\\377A'; printf '\\200B' >&2; exit 7"))
