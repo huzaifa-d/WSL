@@ -110,6 +110,9 @@ hide a delivered datagram. The tests use owned files and controlled host ports;
 they require a reachable host IPv4 route and do not modify firewall rules.
 The live tests also exercise one-shot lifecycle defaults and rejections, the
 accepted legacy fallback settings and a subsequent run after a timeout.
+The live-output check uses a guest/host acknowledgement; on failure it tries
+to release the guest and reap its runner, then terminates that test-owned
+runner if needed. Forced termination does not guarantee native VM cleanup.
 The OCI fixture fetches a digest-pinned public base image, checks generated
 layers, and serves the test image from an unauthenticated registry bound only
 to loopback. Its child proxy environment is isolated from the parent.

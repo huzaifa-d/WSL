@@ -8,14 +8,72 @@ import pathlib
 import subprocess
 import sys
 import threading
+import tempfile
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 import oci_layers
 
 
 class FixtureTests(unittest.TestCase):
+    def test_registry_thread_start_failure_closes_socket(self):
+        servers = []
+        original_server = http.server.ThreadingHTTPServer
+
+        def create_server(*args, **kwargs):
+            server = original_server(*args, **kwargs)
+            servers.append(server)
+            return server
+
+        try:
+            with (mock.patch.object(oci_layers.http.server, "ThreadingHTTPServer", side_effect=create_server),
+                  mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("thread unavailable"))):
+                with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+                    oci_layers.serve_fixture(b"{}", {}, "test-tag")
+            self.assertEqual(len(servers), 1)
+            self.assertEqual(servers[0].socket.fileno(), -1)
+        finally:
+            for server in servers:
+                if server.socket.fileno() != -1:
+                    server.server_close()
+
+    def test_request_write_failure_stops_owned_registry(self):
+        created = []
+        original_serve = oci_layers.serve_fixture
+        original_write = pathlib.Path.write_text
+
+        def serve(*args):
+            server, thread = original_serve(*args)
+            created.append((server, thread))
+            return server, thread
+
+        def fail_request(path, *args, **kwargs):
+            if path.name == "request.json":
+                raise OSError("injected request write failure")
+            return original_write(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as scratch:
+            args = ["oci_layers.py", "--runner", sys.executable, "--scratch", scratch]
+            try:
+                with (mock.patch.object(sys, "argv", args),
+                      mock.patch.object(oci_layers, "load_public_base", return_value=self.base()),
+                      mock.patch.object(oci_layers, "serve_fixture", side_effect=serve),
+                      mock.patch.object(pathlib.Path, "write_text", fail_request)):
+                    with self.assertRaisesRegex(OSError, "injected request write failure"):
+                        oci_layers.main()
+                self.assertEqual(len(created), 1)
+                server, thread = created[0]
+                self.assertFalse(thread.is_alive(), "registry thread remains alive")
+                self.assertEqual(server.socket.fileno(), -1, "registry socket remains open")
+            finally:
+                for server, thread in created:
+                    if thread.is_alive():
+                        server.shutdown()
+                        server.server_close()
+                        thread.join()
+
     def test_request_uses_one_shot_microvm_and_guest_shell_script(self):
         image = "127.0.0.1:12345/fixture:tag"
         script = oci_layers.guest_script(None)

@@ -13,10 +13,12 @@ import ipaddress
 import json
 import os
 import pathlib
+import queue
 import re
 import shlex
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -27,6 +29,7 @@ import uuid
 IMAGE = "docker.io/library/python:3.12-alpine"
 RUNNER = None
 SCRATCH = None
+CLEANUP_GRACE = 10
 
 
 def guest_path(path):
@@ -183,6 +186,113 @@ def assert_lifecycle_rejected(result, expected, marker, state):
         raise AssertionError("rejected lifecycle request wrote the guest marker")
     if state.exists():
         raise AssertionError("rejected lifecycle request created NVX state")
+
+
+def cleanup_child(process, readers):
+    if process.poll() is None:
+        try:
+            process.wait(timeout=CLEANUP_GRACE)
+        except subprocess.TimeoutExpired:
+            print("Test runner did not exit; terminating the owned child. Native VM cleanup is not guaranteed.",
+                  file=sys.stderr)
+            process.kill()
+            process.wait(timeout=10)
+    for reader in readers:
+        reader.join(timeout=3)
+        if reader.is_alive():
+            raise RuntimeError("owned child exited but its output reader did not finish")
+    for stream in (process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            stream.close()
+
+
+def check_live_output(command, environment, ack, timeout=120):
+    with tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=stderr)
+        readers = []
+        try:
+            received = queue.Queue()
+            def read_stdout():
+                try:
+                    received.put((process.stdout.read(6), None))
+                    received.put((process.stdout.read(), None))
+                except Exception as error:
+                    received.put((None, error))
+            reader = threading.Thread(target=read_stdout, daemon=True)
+            reader.start()
+            readers.append(reader)
+            try:
+                prefix, error = received.get(timeout=timeout)
+            except queue.Empty as error:
+                raise TimeoutError("live stdout did not arrive before the deadline") from error
+            if error is not None:
+                raise error
+            if prefix != b"BEFORE":
+                raise AssertionError("live stdout did not begin with BEFORE")
+            if process.poll() is not None:
+                raise AssertionError("runner exited before live output was acknowledged")
+            ack.write_bytes(b"ack")
+            try:
+                stdout, error = received.get(timeout=timeout)
+            except queue.Empty as error:
+                raise TimeoutError("live stdout did not finish before the deadline") from error
+            if error is not None:
+                raise error
+            process.wait(timeout=timeout)
+            if process.returncode != 0 or stdout != b"AFTER":
+                stderr.seek(0)
+                raise AssertionError(f"live output failed: exit={process.returncode} stderr={stderr.read()!r}")
+        finally:
+            try:
+                if process.poll() is None and not ack.exists():
+                    ack.write_bytes(b"ack")
+            finally:
+                cleanup_child(process, readers)
+
+
+def check_broken_writer(command, environment, readiness_timeout=120, exit_timeout=25):
+    process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    readers = []
+    try:
+        lines = queue.Queue()
+        captured = []
+        failures = []
+        def read_stderr():
+            try:
+                for line in process.stderr:
+                    captured.append(line)
+                    lines.put((line, None))
+                lines.put((None, None))
+            except Exception as error:
+                failures.append(error)
+                lines.put((None, error))
+        reader = threading.Thread(target=read_stderr, daemon=True)
+        reader.start()
+        readers.append(reader)
+        process.stdout.close()
+        deadline = time.monotonic() + readiness_timeout
+        while True:
+            try:
+                line, error = lines.get(timeout=max(0, deadline - time.monotonic()))
+            except queue.Empty as error:
+                raise TimeoutError("guest did not report writer readiness before the deadline") from error
+            if error is not None:
+                raise error
+            if line is None:
+                raise AssertionError("guest did not report writer readiness")
+            if b"WRITER_READY\n" in line:
+                break
+        process.wait(timeout=exit_timeout)
+        reader.join(timeout=3)
+        if reader.is_alive():
+            raise RuntimeError("stderr reader did not finish after runner exit")
+        if failures:
+            raise failures[0]
+        stderr = b"".join(captured)
+        if process.returncode != 1 or b"stdout forwarding failed" not in stderr:
+            raise AssertionError(f"broken writer was not reported: exit={process.returncode} stderr={stderr!r}")
+    finally:
+        cleanup_child(process, readers)
 
 
 NETWORK_PROBE = """
@@ -454,28 +564,28 @@ class NvxPolicyTests(unittest.TestCase):
                     self.assertIn(b"workload timed out", result.stderr)
 
     def test_streams_are_live_and_a_broken_writer_stops_the_guest(self):
-        config = request("printf BEFORE; sleep 2; printf AFTER")
-        process = subprocess.Popen(self.command(config), env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.assertEqual(process.stdout.read(6), b"BEFORE")
-        self.assertIsNone(process.poll(), "first output arrived only after the guest exited")
-        stdout, stderr = process.communicate()
-        self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
-        self.assertEqual(stdout, b"AFTER")
+        root = pathlib.Path(tempfile.mkdtemp(prefix="o", dir=SCRATCH))
+        ack = root / "ack"
+        script = """
+import os, pathlib, sys, time
+ack = pathlib.Path(os.environ["NVX_OUTPUT_ROOT"]) / "ack"
+sys.stdout.buffer.write(b"BEFORE")
+sys.stdout.buffer.flush()
+deadline = time.monotonic() + 180
+while not ack.exists() and time.monotonic() < deadline:
+    time.sleep(0.05)
+if not ack.exists():
+    raise TimeoutError("host did not acknowledge live output")
+sys.stdout.buffer.write(b"AFTER")
+sys.stdout.buffer.flush()
+"""
+        config = request(python_command(script), filesystem={"readwritePaths": [str(root)]})
+        config["process"].update({"timeout": 180000, "inheritDefaultEnv": True,
+                                  "env": ["NVX_OUTPUT_ROOT=" + guest_path(root)]})
+        check_live_output(self.command(config), self.env, ack)
         config = request(python_command('import os\nos.write(2, b"WRITER_READY\\n")\nwhile True: os.write(1, b"x" * 65536)'))
         config["process"]["timeout"] = 30000
-        process = subprocess.Popen(self.command(config), env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        process.stdout.close()
-        while True:
-            line = process.stderr.readline()
-            self.assertTrue(line, "guest did not report writer readiness")
-            if b"WRITER_READY\n" in line:
-                break
-        start = time.monotonic()
-        stderr = process.stderr.read()
-        process.stderr.close()
-        self.assertEqual(process.wait(), 1)
-        self.assertIn(b"stdout forwarding failed", stderr)
-        self.assertLess(time.monotonic() - start, 25, "writer failure did not stop the workload before its timeout")
+        check_broken_writer(self.command(config), self.env)
 
     def test_invalid_memory_environment_and_ui_are_rejected(self):
         cases = []

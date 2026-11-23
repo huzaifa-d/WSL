@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -44,6 +45,165 @@ class LifecyclePolicyRegressionTests(unittest.TestCase):
                     with self.assertRaisesRegex(AssertionError, "created NVX state"):
                         nvx_policy.assert_lifecycle_rejected(rejected, expected, marker, state)
                     state.rmdir()
+
+
+class StreamingCleanupTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(nvx_policy, "CLEANUP_GRACE", 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def start_tracked(self, children):
+        original = subprocess.Popen
+        def start(*args, **kwargs):
+            child = original(*args, **kwargs)
+            children.append(child)
+            return child
+        return start
+
+    def test_live_output_mismatch_reaps_owned_child(self):
+        children = []
+        with tempfile.TemporaryDirectory() as root:
+            ack = pathlib.Path(root) / "ack"
+            command = [sys.executable, "-c",
+                       "import sys,time; sys.stdout.buffer.write(b'WRONG!'); sys.stdout.flush(); time.sleep(60)"]
+            try:
+                with mock.patch.object(nvx_policy.subprocess, "Popen", side_effect=self.start_tracked(children)):
+                    with self.assertRaises(AssertionError):
+                        nvx_policy.check_live_output(command, os.environ.copy(), ack, timeout=3)
+                self.assertEqual(len(children), 1)
+                self.assertIsNotNone(children[0].poll(), "owned child was not reaped")
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait()
+
+    def test_broken_writer_readiness_failure_reaps_owned_child(self):
+        children = []
+        command = [sys.executable, "-c",
+                   "import sys,time; sys.stderr.buffer.write(b'WRONG\\n'); sys.stderr.flush(); time.sleep(60)"]
+        try:
+            with mock.patch.object(nvx_policy.subprocess, "Popen", side_effect=self.start_tracked(children)):
+                with self.assertRaises((AssertionError, TimeoutError)):
+                    nvx_policy.check_broken_writer(command, os.environ.copy(), readiness_timeout=1, exit_timeout=3)
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll(), "owned child was not reaped")
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+
+    def test_broken_writer_unexpected_eof_reaps_owned_child(self):
+        children = []
+        command = [sys.executable, "-c", "import time; time.sleep(60)"]
+        start = self.start_tracked(children)
+        class EmptyReader:
+            def __init__(self, stream):
+                self.stream = stream
+            def __iter__(self):
+                return iter(())
+            @property
+            def closed(self):
+                return self.stream.closed
+            def close(self):
+                self.stream.close()
+        def start_with_eof(*args, **kwargs):
+            child = start(*args, **kwargs)
+            child.stderr = EmptyReader(child.stderr)
+            return child
+        try:
+            with mock.patch.object(nvx_policy.subprocess, "Popen", side_effect=start_with_eof):
+                with self.assertRaisesRegex(AssertionError, "guest did not report writer readiness"):
+                    nvx_policy.check_broken_writer(command, os.environ.copy(), readiness_timeout=3)
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll(), "owned child was not reaped")
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+
+    def test_missing_live_output_times_out_and_reaps_owned_child(self):
+        children = []
+        with tempfile.TemporaryDirectory() as root:
+            ack = pathlib.Path(root) / "ack"
+            command = [sys.executable, "-c", "import time; time.sleep(60)"]
+            try:
+                with mock.patch.object(nvx_policy.subprocess, "Popen", side_effect=self.start_tracked(children)):
+                    with self.assertRaisesRegex(TimeoutError, "live stdout"):
+                        nvx_policy.check_live_output(command, os.environ.copy(), ack, timeout=1)
+                self.assertEqual(len(children), 1)
+                self.assertIsNotNone(children[0].poll(), "owned child was not reaped")
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait()
+
+    def test_bad_output_acknowledges_and_reaps_cooperative_child(self):
+        children = []
+        with tempfile.TemporaryDirectory() as root:
+            ack = pathlib.Path(root) / "ack"
+            script = (
+                "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); "
+                "sys.stdout.buffer.write(b'WRONG!'); sys.stdout.flush(); "
+                "deadline=time.monotonic()+10; "
+                "\nwhile not p.exists() and time.monotonic()<deadline: time.sleep(0.02)\n"
+                "assert p.exists()"
+            )
+            try:
+                with mock.patch.object(nvx_policy.subprocess, "Popen", side_effect=self.start_tracked(children)):
+                    with self.assertRaises(AssertionError):
+                        nvx_policy.check_live_output([sys.executable, "-c", script, str(ack)],
+                                                     os.environ.copy(), ack, timeout=3)
+                self.assertTrue(ack.exists())
+                self.assertEqual(children[0].poll(), 0)
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait()
+
+    def test_reader_thread_start_failure_reaps_owned_child(self):
+        for kind in ("live", "broken"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                children = []
+                command = [sys.executable, "-c", "import time; time.sleep(60)"]
+                try:
+                    with (mock.patch.object(nvx_policy.subprocess, "Popen", side_effect=self.start_tracked(children)),
+                          mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("thread unavailable"))):
+                        with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+                            if kind == "live":
+                                nvx_policy.check_live_output(command, os.environ.copy(), pathlib.Path(root) / "ack", timeout=1)
+                            else:
+                                nvx_policy.check_broken_writer(command, os.environ.copy(), readiness_timeout=1)
+                    self.assertEqual(len(children), 1)
+                    self.assertIsNotNone(children[0].poll(), "owned child was not reaped")
+                finally:
+                    for child in children:
+                        if child.poll() is None:
+                            child.kill()
+                            child.wait()
+
+    def test_live_output_remains_live_when_reader_is_delayed(self):
+        with tempfile.TemporaryDirectory() as root:
+            ack = pathlib.Path(root) / "ack"
+            script = (
+                "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); "
+                "sys.stdout.buffer.write(b'BEFORE'); sys.stdout.flush(); "
+                "deadline=time.monotonic()+10; "
+                "\nwhile not p.exists() and time.monotonic()<deadline: time.sleep(0.02)\n"
+                "assert p.exists(); sys.stdout.buffer.write(b'AFTER'); sys.stdout.flush()"
+            )
+            get = nvx_policy.queue.Queue.get
+            def delayed_get(queue, *args, **kwargs):
+                time.sleep(2.2)
+                return get(queue, *args, **kwargs)
+            with mock.patch.object(nvx_policy.queue.Queue, "get", delayed_get):
+                nvx_policy.check_live_output([sys.executable, "-c", script, str(ack)],
+                                             os.environ.copy(), ack, timeout=8)
 
 
 class ProbeRegressionTests(unittest.TestCase):

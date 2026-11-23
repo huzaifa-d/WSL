@@ -280,8 +280,12 @@ def serve_fixture(manifest, blobs, tag):
                 self.wfile.write(body)
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
+    try:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+    except Exception:
+        server.server_close()
+        raise
     return server, thread
 
 
@@ -317,14 +321,14 @@ def main():
     (root / "fixture.json").write_text(json.dumps(details, indent=2) + "\n", encoding="utf-8")
     tag = uuid.uuid4().hex
     server, thread = serve_fixture(image, blobs, tag)
-    reference = f"127.0.0.1:{server.server_port}/fixture:{tag}"
-    config = root / "request.json"
-    config.write_text(json.dumps(runner_request(reference, guest_script(args.symlink_case))), encoding="utf-8")
-    command = [str(args.runner), "--config", str(config)]
-    environment = registry_child_environment(os.environ)
-    environment["LOCALAPPDATA"] = str(root)
-    environment.pop("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR", None)
     try:
+        reference = f"127.0.0.1:{server.server_port}/fixture:{tag}"
+        config = root / "request.json"
+        config.write_text(json.dumps(runner_request(reference, guest_script(args.symlink_case))), encoding="utf-8")
+        command = [str(args.runner), "--config", str(config)]
+        environment = registry_child_environment(os.environ)
+        environment["LOCALAPPDATA"] = str(root)
+        environment.pop("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR", None)
         with registry_opener().open(f"http://127.0.0.1:{server.server_port}/v2/", timeout=5) as response:
             if response.read() != b"{}":
                 raise RuntimeError("local registry readiness check failed")
@@ -333,9 +337,13 @@ def main():
         result = subprocess.run(command, capture_output=True, check=False,
                                 env=environment)
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
+        try:
+            server.shutdown()
+        finally:
+            try:
+                server.server_close()
+            finally:
+                thread.join()
     (root / "stdout").write_bytes(result.stdout)
     (root / "stderr").write_bytes(result.stderr)
     if not (root / "Microsoft" / "MXC" / "nvx").is_dir():
