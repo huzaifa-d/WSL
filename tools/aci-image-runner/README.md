@@ -7,7 +7,10 @@ and the x64 MSVC build tools.
 
 The runner pins `mxc-sdk` to
 [`40eebd39ab5e5a02d350169a8c96c28b33ddba7e`](https://github.com/microsoft/mxc/tree/40eebd39ab5e5a02d350169a8c96c28b33ddba7e)
-with its `microvm` feature. The SDK build stages the complete signed agent
+with its `microvm` feature. This revision identifies the SDK as `1.1.0` and
+pins `aci_edge_sandboxes` `0.1.2`, which stages agent release
+`v0.2.0-build189870623` (sandbox ABI `3`, guest runtime ABI
+`microvm-abi-v2-edge-ramfs-v7`). The SDK build stages the complete signed agent
 bundle and verifies its approved hashes and signatures; it requires access to
 the release and Windows certificate trust and revocation services. Keep the
 staged `aci-edge-sandboxes` directory beside the executable. Do not copy only
@@ -59,6 +62,11 @@ stderr are streamed separately as bytes, and the guest exit code is returned.
 MXC or native runtime diagnostics and warnings can also appear on stderr.
 A workload timeout is reported as an error. Images must be registry
 references; MXC handles bundle discovery, image acquisition and caching.
+The agent caches each image by the original reference text: rerunning the same
+reference can reuse the first-pulled content without contacting the registry.
+A moving tag such as `latest` may therefore continue to run an older image
+after the tag changes. Use a digest reference (`repository@sha256:...`) when
+exact image identity matters.
 
 MXC stores sandbox records, registered images and platform templates under
 `%LOCALAPPDATA%\Microsoft\MXC\nvx\<bundle>` and protects that directory for
@@ -66,6 +74,8 @@ the current user and Local SYSTEM. The state and image cache are reused and
 are not deleted by the runner. MXC rejects reparse points in the state path.
 Long paths may also be rejected by the native agent; use a short, owned,
 physical directory for isolated test state.
+For cache refresh and safe state removal, follow the pinned MXC
+[agent state directory instructions](https://github.com/microsoft/mxc/blob/40eebd39ab5e5a02d350169a8c96c28b33ddba7e/docs/backends/nvx/nvx.md#agent-state-directory).
 
 ## Tests
 
