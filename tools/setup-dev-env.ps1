@@ -84,7 +84,9 @@ if ($LASTEXITCODE -ne 0)
 
 # ── Done ────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "All prerequisites installed. Ready to build!" -ForegroundColor Green
+Write-Host "Visual Studio prerequisites installed." -ForegroundColor Green
+Write-Host "For x64 builds, also install a current Rust toolchain with the x86_64-pc-windows-msvc target."
+Write-Host "The build must be able to retrieve and verify the pinned ACI agent bundle."
 Write-Host ""
 Write-Host "  cmake ."
 Write-Host "  cmake --build . -- -m"

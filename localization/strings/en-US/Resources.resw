@@ -2689,6 +2689,30 @@ For privacy information about this product please visit https://aka.ms/privacy.<
   <data name="MessageWslcExportInProgress" xml:space="preserve">
     <value>Export in progress.</value>
   </data>
+  <data name="WSLCCLI_AciCommandDesc" xml:space="preserve">
+    <value>Run commands in ACI micro-VMs.</value>
+    <comment>{Locked="ACI"}Product names should not be translated</comment>
+  </data>
+  <data name="WSLCCLI_AciCommandLongDesc" xml:space="preserve">
+    <value>Run a one-shot command in an ACI micro-VM.</value>
+    <comment>{Locked="ACI"}Product names should not be translated</comment>
+  </data>
+  <data name="WSLCCLI_AciRunDesc" xml:space="preserve">
+    <value>Run an ACI request.</value>
+    <comment>{Locked="ACI"}Product names should not be translated</comment>
+  </data>
+  <data name="WSLCCLI_AciRunLongDesc" xml:space="preserve">
+    <value>Run one command using an ACI request file.</value>
+    <comment>{Locked="ACI"}Product names should not be translated</comment>
+  </data>
+  <data name="WSLCCLI_AciConfigArgDescription" xml:space="preserve">
+    <value>Path to the JSON request file.</value>
+    <comment>{Locked="JSON"}File format names should not be translated</comment>
+  </data>
+  <data name="MessageAciRunnerUsage" xml:space="preserve">
+    <value>Usage: aci-image-runner.exe --config &lt;file&gt;</value>
+    <comment>{Locked="aci-image-runner.exe"}{Locked="--config"}Command and argument names should not be translated</comment>
+  </data>
   <data name="WSLCCLI_RootCommandDesc" xml:space="preserve">
     <value>WSLC is the Windows Subsystem for Linux Container CLI tool.</value>
     <comment>{Locked="WSLC"}Product names should not be translated</comment>

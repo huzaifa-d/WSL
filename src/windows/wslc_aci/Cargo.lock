@@ -3,15 +3,6 @@
 version = 4
 
 [[package]]
-name = "aci-image-runner"
-version = "0.1.0"
-dependencies = [
- "mxc-sdk",
- "tempfile",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "aci_edge_sandboxes"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -619,7 +610,6 @@ name = "mxc-sdk"
 version = "1.1.0"
 source = "git+https://github.com/microsoft/mxc.git?rev=40eebd39ab5e5a02d350169a8c96c28b33ddba7e#40eebd39ab5e5a02d350169a8c96c28b33ddba7e"
 dependencies = [
- "aci_edge_sandboxes",
  "anyhow",
  "base64 0.22.1",
  "cc",
@@ -628,7 +618,6 @@ dependencies = [
  "flatbuffers",
  "getrandom 0.2.17",
  "libc",
- "libloading",
  "native-tls",
  "nix 0.29.0",
  "same-file",
@@ -1587,6 +1576,17 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "wslc_aci_bridge"
+version = "0.1.0"
+dependencies = [
+ "aci_edge_sandboxes",
+ "aci_edge_sandboxes_model",
+ "mxc-sdk",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "yoke"

@@ -16,6 +16,7 @@ import tempfile
 import threading
 import urllib.request
 import uuid
+from wslc_test_environment import require_isolated_profile
 
 
 BASE = "https://mcr.microsoft.com/v2/azurelinux/base/core"
@@ -291,16 +292,24 @@ def serve_fixture(manifest, blobs, tag):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runner", type=pathlib.Path, required=True)
+    entry = parser.add_mutually_exclusive_group(required=True)
+    entry.add_argument("--runner", type=pathlib.Path)
+    entry.add_argument("--wslc", type=pathlib.Path)
     parser.add_argument("--scratch", type=pathlib.Path, required=True)
+    parser.add_argument("--isolated-profile", action="store_true")
     parser.add_argument("--mutant", choices=("none",) + MUTANTS, default="none")
     parser.add_argument("--symlink-case", choices=tuple(SYMLINK_CASES))
     args = parser.parse_args()
     if args.mutant != "none" and args.symlink_case is not None:
         parser.error("--symlink-case cannot be combined with --mutant")
-    for path in (args.runner, args.scratch):
+    executable = args.runner if args.runner else args.wslc
+    for path in (executable, args.scratch):
         if not path.is_absolute() or not path.exists():
             parser.error(f"path must be absolute and exist: {path}")
+    try:
+        state = require_isolated_profile(args.scratch, args.isolated_profile)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     root = pathlib.Path(tempfile.mkdtemp(prefix="oci-layers-", dir=args.scratch))
     print(f"scratch={root}", flush=True)
     manifest, config, base_blobs = load_public_base()
@@ -325,15 +334,15 @@ def main():
         reference = f"127.0.0.1:{server.server_port}/fixture:{tag}"
         config = root / "request.json"
         config.write_text(json.dumps(runner_request(reference, guest_script(args.symlink_case))), encoding="utf-8")
-        command = [str(args.runner), "--config", str(config)]
+        entrypoint = [str(executable)] if args.runner else [str(executable), "aci", "run"]
+        command = [*entrypoint, "--config", str(config)]
         environment = registry_child_environment(os.environ)
-        environment["LOCALAPPDATA"] = str(root)
         environment.pop("ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR", None)
         with registry_opener().open(f"http://127.0.0.1:{server.server_port}/v2/", timeout=5) as response:
             if response.read() != b"{}":
                 raise RuntimeError("local registry readiness check failed")
         (root / "command.json").write_text(json.dumps(command, indent=2) + "\n", encoding="utf-8")
-        print(f"runner image={reference} LOCALAPPDATA={root}", flush=True)
+        print(f"runner image={reference} test-profile ACI state={state}", flush=True)
         result = subprocess.run(command, capture_output=True, check=False,
                                 env=environment)
     finally:
@@ -346,8 +355,8 @@ def main():
                 thread.join()
     (root / "stdout").write_bytes(result.stdout)
     (root / "stderr").write_bytes(result.stderr)
-    if not (root / "Microsoft" / "MXC" / "nvx").is_dir():
-        raise RuntimeError("SDK state was not created under the owned LOCALAPPDATA directory")
+    if not state.is_dir():
+        raise RuntimeError("WSLC ACI state was not created in the isolated test profile")
     print(f"runner exit={result.returncode} stdout={root / 'stdout'} stderr={root / 'stderr'}", flush=True)
     print(f"stdout={result.stdout!r}\nstderr={result.stderr!r}", flush=True)
     validate_result(result, args.mutant, args.symlink_case)

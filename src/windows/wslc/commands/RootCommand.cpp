@@ -14,6 +14,7 @@ Abstract:
 #include "RootCommand.h"
 
 // Include all commands that parent to the root.
+#include "AciCommand.h"
 #include "ContainerCommand.h"
 #include "ImageCommand.h"
 #include "NetworkCommand.h"
@@ -33,6 +34,7 @@ using namespace wsl::windows::wslc::cli;
 std::vector<std::unique_ptr<Command>> RootCommand::CreateCommands() const
 {
     std::vector<std::unique_ptr<Command>> commands;
+    commands.push_back(std::make_unique<AciCommand>(FullName()));
     commands.push_back(std::make_unique<ContainerCommand>(FullName()));
     commands.push_back(std::make_unique<ImageCommand>(FullName()));
     commands.push_back(std::make_unique<NetworkCommand>(FullName()));

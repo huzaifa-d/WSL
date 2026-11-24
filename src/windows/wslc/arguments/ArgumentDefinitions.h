@@ -34,6 +34,7 @@ Abstract:
 // execution (see ArgumentConvertedTypes.h). Use NoConversion for arguments that are not converted to a typed value.
 // clang-format off
 #define WSLC_ARGUMENTS(_) \
+_(AciConfig,        "config",               NO_ALIAS,         Kind::Value,      NoConversion, Localization::WSLCCLI_AciConfigArgDescription()) \
 _(All,              "all",                  L"a",             Kind::Flag,       NoConversion, Localization::WSLCCLI_AllArgDescription()) \
 _(AllTags,          "all-tags",             L"a",             Kind::Flag,       NoConversion, Localization::WSLCCLI_AllTagsArgDescription()) \
 _(Archive,          "archive",              L"a",             Kind::Flag,       NoConversion, Localization::WSLCCLI_ArchiveArgDescription()) \

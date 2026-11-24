@@ -1,0 +1,5 @@
+add_executable(aci-image-runner main.cpp)
+target_link_libraries(aci-image-runner PRIVATE wslc_aci_client ${COMMON_LINK_LIBRARIES})
+target_precompile_headers(aci-image-runner REUSE_FROM common)
+add_dependencies(aci-image-runner wslserviceidl)
+set_target_properties(aci-image-runner PROPERTIES FOLDER tools)

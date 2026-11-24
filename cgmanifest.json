@@ -6,6 +6,24 @@
             "component": {
                 "type": "git",
                 "git": {
+                    "repositoryUrl": "https://github.com/microsoft/mxc",
+                    "commitHash": "40eebd39ab5e5a02d350169a8c96c28b33ddba7e"
+                }
+            }
+        },
+        {
+            "component": {
+                "type": "git",
+                "git": {
+                    "repositoryUrl": "https://github.com/Azure/aci-edge-sandbox",
+                    "commitHash": "f749739eebf4ab630bddc230f32af6e11383c784"
+                }
+            }
+        },
+        {
+            "component": {
+                "type": "git",
+                "git": {
                     "repositoryUrl": "https://github.com/llvm/llvm-project",
                     "commitHash": "d32170dbd5b0d54436537b6b75beaf44324e0c28"
                 }

@@ -21,6 +21,12 @@ winget configure -f .config/configuration.vsEnterprise.winget      # Enterprise
 
 > **Note:** `winget configure --enable` is required to enable the configuration feature. The `setup-dev-env.ps1` script runs this automatically.
 
+Normal x64 builds also require a current [Rust toolchain](https://www.rust-lang.org/tools/install)
+with the `x86_64-pc-windows-msvc` target for the WSLC ACI bridge. The build stages and verifies
+the pinned ACI agent bundle, so access to its release and to Windows certificate trust and
+revocation services is required. The setup script does not install Rust. The ACI execution path
+is opt-in; its current agent bundle supports x64 only.
+
 <details>
 <summary>Manual installation</summary>
 

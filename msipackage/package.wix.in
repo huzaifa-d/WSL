@@ -416,6 +416,14 @@
                     </RegistryKey>
                 </RegistryKey>
 
+                <!-- IWSLCAciRun-->
+                <RegistryKey Root="HKCR" Key="Interface\{1617581E-058E-4231-9F2C-8A67D3264864}">
+                    <RegistryValue Value="IWSLCAciRun" Type="string" />
+                    <RegistryKey Key="ProxyStubClsid32">
+                        <RegistryValue Value="{4EA0C6DD-E9FF-48E7-994E-13A31D10DC60}" Type="string" />
+                    </RegistryKey>
+                </RegistryKey>
+
                 <!-- IWSLCSessionReference-->
                 <RegistryKey Root="HKCR" Key="Interface\{B3A72F48-9D15-4E8A-A621-7C3E84F09B52}">
                     <RegistryValue Value="IWSLCSessionReference" Type="string" />

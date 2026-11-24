@@ -1,0 +1,22 @@
+[package]
+name = "wslc_aci_bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = []
+translator = ["dep:mxc-sdk", "dep:aci_edge_sandboxes_model", "dep:serde", "dep:serde_json"]
+agent = ["dep:mxc-sdk", "dep:aci_edge_sandboxes_model", "dep:aci_edge_sandboxes", "dep:serde", "dep:serde_json"]
+
+[dependencies]
+mxc-sdk = { git = "https://github.com/microsoft/mxc.git", rev = "40eebd39ab5e5a02d350169a8c96c28b33ddba7e", default-features = false, optional = true }
+aci_edge_sandboxes_model = { version = "=0.1.2", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+aci_edge_sandboxes = { version = "=0.1.2", default-features = false, features = ["agent-bundled"], optional = true }

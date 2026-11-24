@@ -14,6 +14,7 @@ Abstract:
 
 #include "precomp.h"
 #include "SessionService.h"
+#include "WslcSessionManagerClient.h"
 #include "ConsoleService.h"
 #include "JsonUtils.h"
 #include "WarningCallback.h"
@@ -93,10 +94,7 @@ namespace {
 
 static wil::com_ptr<IWSLCSessionManager> CreateSessionManager()
 {
-    wil::com_ptr<IWSLCSessionManager> manager;
-    THROW_IF_FAILED(CoCreateInstance(__uuidof(WSLCSessionManager), nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&manager)));
-    wsl::windows::common::security::ConfigureForCOMImpersonation(manager.get());
-    return manager;
+    return wsl::windows::common::wslc::CreateSessionManager();
 }
 
 Session SessionService::OpenSessionByName(const wil::com_ptr<IWSLCSessionManager>& manager, LPCWSTR displayName)

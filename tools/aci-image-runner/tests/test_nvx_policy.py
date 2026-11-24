@@ -42,7 +42,7 @@ class LifecyclePolicyRegressionTests(unittest.TestCase):
                         nvx_policy.assert_lifecycle_rejected(rejected, expected, marker, state)
                     marker.unlink()
                     state.mkdir(parents=True)
-                    with self.assertRaisesRegex(AssertionError, "created NVX state"):
+                    with self.assertRaisesRegex(AssertionError, "created ACI state"):
                         nvx_policy.assert_lifecycle_rejected(rejected, expected, marker, state)
                     state.rmdir()
 

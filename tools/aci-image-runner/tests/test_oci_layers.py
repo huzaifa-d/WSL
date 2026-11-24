@@ -55,9 +55,10 @@ class FixtureTests(unittest.TestCase):
             return original_write(path, *args, **kwargs)
 
         with tempfile.TemporaryDirectory() as scratch:
-            args = ["oci_layers.py", "--runner", sys.executable, "--scratch", scratch]
+            args = ["oci_layers.py", "--runner", sys.executable, "--scratch", scratch, "--isolated-profile"]
             try:
                 with (mock.patch.object(sys, "argv", args),
+                      mock.patch.object(oci_layers, "require_isolated_profile", return_value=pathlib.Path(scratch) / "wslc-aci"),
                       mock.patch.object(oci_layers, "load_public_base", return_value=self.base()),
                       mock.patch.object(oci_layers, "serve_fixture", side_effect=serve),
                       mock.patch.object(pathlib.Path, "write_text", fail_request)):

@@ -430,6 +430,18 @@ typedef struct _WSLCHandle
 } WSLCHandle;
 
 [
+    uuid(1617581E-058E-4231-9F2C-8A67D3264864),
+    pointer_default(unique),
+    object
+]
+interface IWSLCAciRun : IUnknown
+{
+    HRESULT GetStreams([out] WSLCHandle* Stdout, [out] WSLCHandle* Stderr);
+    HRESULT Wait([out] LONG* ExitCode);
+    HRESULT Cancel();
+};
+
+[
     uuid(1AD163CD-393D-4B33-83A2-8A3F3F23E608),
     pointer_default(unique),
     object
@@ -857,6 +869,12 @@ interface IWSLCSession : IUnknown
     // Used only for testing. Fails the next CreateNetwork after dockerd created the network, so the
     // rollback path can be exercised.
     HRESULT SetNetworkFaultsForTest([in] BOOL FailCreateInspect);
+
+    // Runs one translated ACI request in a separate, disposable micro-VM.
+    HRESULT StartAciRun(
+        [in] ULONG RequestSize,
+        [in, size_is(RequestSize)] const byte* Request,
+        [out] IWSLCAciRun** Run);
 }
 
 //

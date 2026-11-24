@@ -23,6 +23,7 @@ set(SOURCES
     wslc/services/ICredentialStorage.cpp
     wslc/services/FileCredStorage.cpp
     wslc/services/WinCredStorage.cpp
+    wslc/services/WslcSessionManagerClient.cpp
     wslc/cli/InputChannel.cpp
     wslc/cli/OutputChannel.cpp
     wslc/cli/Terminal.cpp
@@ -127,6 +128,7 @@ set(HEADERS
     wslc/services/ICredentialStorage.h
     wslc/services/FileCredStorage.h
     wslc/services/WinCredStorage.h
+    wslc/services/WslcSessionManagerClient.h
     wslc/cli/InputChannel.h
     wslc/cli/OutputChannel.h
     wslc/cli/Terminal.h

@@ -10,6 +10,7 @@ set(SOURCES
     # Session and container implementation
     WSLCSession.cpp
     WSLCSessionRuntime.cpp
+    WSLCAciRun.cpp
     WSLCContainer.cpp
     WSLCContainerStateStore.cpp
     WSLCVirtualMachine.cpp
@@ -50,6 +51,7 @@ set(HEADERS
     WSLCProcessIO.h
     WSLCSession.h
     WSLCSessionRuntime.h
+    WSLCAciRun.h
     WSLCSharedLockGate.h
     WSLCIdleState.h
     WSLCSessionFactory.h
@@ -63,6 +65,11 @@ set(HEADERS
 
 add_executable(wslcsession WIN32 ${SOURCES} ${HEADERS})
 add_dependencies(wslcsession wslserviceidl)
+target_include_directories(wslcsession PRIVATE ${CMAKE_SOURCE_DIR}/src/windows/wslc_aci/include)
+if (TARGET_PLATFORM STREQUAL "x64")
+    add_dependencies(wslcsession wslc_aci_agent_build)
+    target_link_libraries(wslcsession wslc_aci_agent)
+endif()
 add_compile_definitions(__WRL_CLASSIC_COM__)
 add_compile_definitions(USE_COM_CONTEXT_DEF=1)
 target_link_libraries(wslcsession

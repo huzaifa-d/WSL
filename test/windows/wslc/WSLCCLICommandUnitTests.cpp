@@ -21,6 +21,7 @@ Abstract:
 
 #include "Command.h"
 #include "RootCommand.h"
+#include "AciCommand.h"
 #include "ContainerCommand.h"
 #include "ImageCommand.h"
 #include "InspectCommand.h"
@@ -82,6 +83,23 @@ class WSLCCLICommandUnitTests
         VERIFY_IS_TRUE(events != subcommands.end());
         VERIFY_ARE_EQUAL(std::wstring(L"root:events"), (*events)->FullName());
         VERIFY_IS_TRUE(typeid(**events) == typeid(SystemEventsCommand));
+    }
+
+    TEST_METHOD(RootCommand_ContainsAciRunCommand)
+    {
+        auto root = RootCommand();
+        const auto& commands = root.GetCommands();
+        const auto aci = std::ranges::find_if(
+            commands, [](const auto& command) { return command->Name() == AciCommand::CommandName; });
+        VERIFY_IS_TRUE(aci != commands.end());
+        const auto& children = (*aci)->GetCommands();
+        const auto run = std::ranges::find_if(
+            children, [](const auto& command) { return command->Name() == AciRunCommand::CommandName; });
+        VERIFY_IS_TRUE(run != children.end());
+        const auto arguments = (*run)->GetArguments();
+        VERIFY_ARE_EQUAL(1u, arguments.size());
+        VERIFY_ARE_EQUAL(std::wstring(L"config"), arguments[0].Name());
+        VERIFY_IS_TRUE(arguments[0].Required());
     }
 
     TEST_METHOD(SystemCommand_ContainsEventsCommand)
